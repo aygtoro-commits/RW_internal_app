@@ -346,65 +346,127 @@ def compare_to_geo5(result: CalculationResult, geo5_values: dict[str, float]) ->
 
 
 # ---------- Engineering diagrams (drawn from the active input/result) ----------
-def _svg_wall_section(d: RetainingWallInput, reinforcement: list[RCDesign] | None = None) -> str:
-    """Return a proportional SVG cross-section, not a decorative static image."""
-    width, height, left, base_y = 760, 420, 72, 326
-    h = d.wall_height; free_x = max(2.2, .45*d.base_width)
-    sx = (width-left-38)/(d.base_width+free_x); sy = min(42, (base_y-52)/max(h+d.base_thickness, .1))
-    toe_x = left; stem_front = toe_x+d.toe_width*sx; stem_back = stem_front+d.stem_thickness_base*sx
-    heel_end = stem_back+d.heel_width*sx; top_y = base_y-h*sy; slab_bottom = base_y+d.base_thickness*sy
-    stem_top_back = stem_front+d.stem_thickness_top*sx
-    terrain_end_y = top_y - (tan(d.terrain.beta_rad)*free_x)*sy
-    soil_poly = f"{stem_back:.1f},{base_y:.1f} {stem_back:.1f},{top_y:.1f} {width-28:.1f},{terrain_end_y:.1f} {width-28:.1f},{base_y:.1f}"
-    wall_poly = f"{stem_front:.1f},{base_y:.1f} {stem_back:.1f},{base_y:.1f} {stem_top_back:.1f},{top_y:.1f} {stem_front:.1f},{top_y:.1f}"
-    stiffener = ""
+def _svg_document(fragments: list[str]) -> str:
+    """Join SVG elements and make the result usable inline or as a standalone file."""
+    return ''.join(fragments).replace('<svg ', '<svg xmlns="http://www.w3.org/2000/svg" ', 1)
+
+
+def _svg_wall_section(d: RetainingWallInput, result: CalculationResult | None = None) -> str:
+    """Line drawing of the analysis model; one coordinate scale in both axes."""
+    width, height, x_toe, y_base = 950, 680, 290.0, 480.0
+    scale = min(48.0, 320.0 / max(d.wall_height, .01), 340.0 / max(d.base_width, .01))
+    x_front = x_toe + d.toe_width * scale
+    x_back = x_front + d.stem_thickness_base * scale
+    x_top_back = x_front + d.stem_thickness_top * scale
+    x_heel = x_toe + d.base_width * scale
+    y_top = y_base - d.wall_height * scale
+    y_bottom = y_base + d.base_thickness * scale
+    y_front = y_base - d.front_soil_height * scale
+    x_soil_end = 900.0
+    flat = d.terrain.flat_length * scale if d.terrain.kind is TerrainKind.FLAT_THEN_INFINITE_SLOPE else 0.0
+    if d.terrain.beta_rad > 0:
+        x_soil_end = min(x_soil_end, x_top_back+flat+max(0.0, y_top-110.0)/tan(d.terrain.beta_rad))
+    x_break = min(x_soil_end, x_top_back + flat)
+    y_soil_end = y_top - max(0.0, x_soil_end - x_break) * tan(d.terrain.beta_rad)
+    ground_path = f'M {x_top_back:.1f} {y_top:.1f} L {x_break:.1f} {y_top:.1f} L {x_soil_end:.1f} {y_soil_end:.1f}'
+    parts = [f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Scale-consistent retaining wall analysis drawing" style="width:100%;height:auto;display:block;background:white">
+    <style>text{{font-family:Arial,sans-serif;fill:#263238}}.title{{font-size:19px;font-weight:700}}.label{{font-size:13px}}.small{{font-size:11px}}.dim{{font-size:12px;fill:#9b5b18}}.earth{{stroke:#d33b3b;fill:none;stroke-width:1.7}}.water{{stroke:#10a6b8;fill:none;stroke-width:1.6;stroke-dasharray:9 6}}.ground{{stroke:#30363b;fill:none;stroke-width:1.7}}.layer{{stroke:#9a9a9a;fill:none;stroke-width:1;stroke-dasharray:5 5}}</style>
+    <rect x="1" y="1" width="{width-2}" height="{height-2}" fill="white" stroke="#444" stroke-width="1.5"/>
+    <text x="28" y="36" class="title">RETAINING WALL — ANALYSIS SECTION</text>
+    <text x="28" y="56" class="small">Geometry uses one scale in both axes; the pressure diagrams below use their own stated scale.</text>
+    <path d="{ground_path}" class="ground"/><path d="M 38 {y_front:.1f} L {x_front:.1f} {y_front:.1f}" class="ground"/>
+    <rect x="{x_toe:.1f}" y="{y_base:.1f}" width="{d.base_width*scale:.1f}" height="{d.base_thickness*scale:.1f}" fill="white" stroke="#27313b" stroke-width="2.2"/>
+    <path d="M {x_front:.1f} {y_base:.1f} L {x_back:.1f} {y_base:.1f} L {x_top_back:.1f} {y_top:.1f} L {x_front:.1f} {y_top:.1f} Z" fill="white" stroke="#27313b" stroke-width="2.2"/>
+    <text x="{x_front-12:.1f}" y="{y_top-10:.1f}" class="label">stem</text>
+    <text x="48" y="{y_front-9:.1f}" class="label">front ground EL {d.front_soil_elevation:.2f} m</text>
+    <text x="{x_top_back+220:.1f}" y="{y_top+24:.1f}" class="label">retained ground EL {d.base_top_elevation+d.wall_height:.2f} m</text>''']
+    # Soil boundaries are drawn as linework, retaining the entered layer depths.
+    depth = 0.0
+    for index, layer in enumerate(d.soils[:-1], 1):
+        depth += layer.thickness
+        if 0 < depth < d.wall_height:
+            yy = y_top + depth * scale
+            parts.append(f'<line x1="{x_back:.1f}" y1="{yy:.1f}" x2="{x_soil_end:.1f}" y2="{yy:.1f}" class="layer"/><text x="{x_soil_end-62:.1f}" y="{yy-5:.1f}" class="small">layer {index+1}</text>')
     if d.stiffener:
-        s=d.stiffener; side_x = stem_back if s.side=="heel" else stem_front
-        direction = 1 if s.side=="heel" else -1
-        y_top = base_y-s.top_elevation*sy; y_const=base_y-s.constant_depth_to_elevation*sy
-        x_top=side_x+direction*s.depth_top*sx; x_base=side_x+direction*s.depth_base*sx
-        stiffener=f'<path d="M {side_x:.1f} {base_y:.1f} L {x_base:.1f} {base_y:.1f} L {x_top:.1f} {y_const:.1f} L {x_top:.1f} {y_top:.1f} L {side_x:.1f} {y_top:.1f} Z" fill="#5689aa55" stroke="#1e5b7a" stroke-width="2" stroke-dasharray="6 4"/><text x="{min(max(x_base,90),650):.1f}" y="{y_const-10:.1f}" class="label">{("Counterfort" if s.side=="heel" else "Buttress")} plane</text>'
-    key = ""
+        s = d.stiffener
+        side = x_back if s.side == "heel" else x_front
+        direction = 1 if s.side == "heel" else -1
+        yt = y_base - s.top_elevation * scale
+        yc = y_base - s.constant_depth_to_elevation * scale
+        xt = side + direction * s.depth_top * scale
+        xb = side + direction * s.depth_base * scale
+        parts.append(f'<path d="M {side:.1f} {y_base:.1f} L {xb:.1f} {y_base:.1f} L {xt:.1f} {yc:.1f} L {xt:.1f} {yt:.1f} L {side:.1f} {yt:.1f} Z" fill="none" stroke="#555" stroke-width="1.5" stroke-dasharray="6 4"/><text x="{xt+8:.1f}" y="{yc-8:.1f}" class="small">{("counterfort" if s.side=="heel" else "buttress")} plane</text>')
     if d.shear_key:
-        k=d.shear_key; x=toe_x+k.x_from_toe*sx-k.thickness*sx/2; key=f'<rect x="{x:.1f}" y="{slab_bottom:.1f}" width="{k.thickness*sx:.1f}" height="{k.depth*sy:.1f}" fill="#b7c4cc" stroke="#52616b" stroke-width="2"/><text x="{x-6:.1f}" y="{slab_bottom+k.depth*sy+18:.1f}" class="label">Shear key</text>'
-    water = ""
-    if d.groundwater.behind_depth is not None and d.groundwater.behind_depth<h:
-        wy=top_y+d.groundwater.behind_depth*sy; water=f'<line x1="{stem_back:.1f}" y1="{wy:.1f}" x2="{width-28:.1f}" y2="{wy:.1f}" stroke="#1882b8" stroke-width="2" stroke-dasharray="8 5"/><text x="{width-125}" y="{wy-7:.1f}" class="water">GWT behind</text>'
-    layers=""; depth=0.
-    for idx,soil in enumerate(d.soils[:-1],1):
-        depth+=soil.thickness
-        if depth<h:
-            yy=top_y+depth*sy; layers+=f'<line x1="{stem_back:.1f}" y1="{yy:.1f}" x2="{width-28:.1f}" y2="{yy:.1f}" stroke="#9f8950" stroke-width="1" stroke-dasharray="4 4"/><text x="{width-96}" y="{yy-4:.1f}" class="dim">Layer {idx+1}</text>'
-    front_ground_y=base_y-d.front_soil_height*sy
-    surcharge=""
-    if d.surcharge_kpa>0:
-        qx1=stem_back+28; qx2=min(width-70,qx1+150); qy=min(top_y,terrain_end_y)-28; arrows="".join(f'<line x1="{xx}" y1="{qy}" x2="{xx}" y2="{qy+18}" stroke="#665c56" stroke-width="1.3"/><path d="M {xx-4} {qy+13} L {xx} {qy+18} L {xx+4} {qy+13}" fill="none" stroke="#665c56"/>' for xx in range(int(qx1+12),int(qx2),28)); surcharge=f'<line x1="{qx1:.1f}" y1="{qy:.1f}" x2="{qx2:.1f}" y2="{qy:.1f}" stroke="#665c56" stroke-width="1.3"/>{arrows}<text x="{qx1:.1f}" y="{qy-8:.1f}" class="label">Surcharge q = {d.surcharge_kpa:.1f} kPa</text>'
-    actions=""
-    for frac in (.30,.55,.80):
-        yy=top_y+frac*h*sy; xx=stem_back+18+frac*42; actions+=f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{stem_back+4:.1f}" y2="{yy:.1f}" stroke="#c7532d" stroke-width="1.6"/><path d="M {stem_back+10:.1f} {yy-4:.1f} L {stem_back+4:.1f} {yy:.1f} L {stem_back+10:.1f} {yy+4:.1f}" fill="none" stroke="#c7532d"/>'
-    actions+=f'<text x="{stem_back+42:.1f}" y="{top_y+h*sy*.58:.1f}" class="label">Pₐ</text>'
-    rebar=""
-    if reinforcement:
-        schedule={x.component:x for x in reinforcement}; stem=schedule.get("stem"); heel=schedule.get("heel slab"); toe=schedule.get("toe slab")
-        # Schematic only: red lines locate primary tension reinforcement faces.
-        if stem:
-            xx=stem_back-8
-            rebar="".join(f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{xx:.1f}" y2="{min(base_y-8,yy+45):.1f}" stroke="#be3343" stroke-width="2"/>' for yy in range(int(top_y+12),int(base_y-15),28))
-            rebar+=f'<text x="{xx+8:.1f}" y="{top_y+18:.1f}" class="label" fill="#be3343">Stem: D{stem.bar_diameter_mm:.0f}@{stem.spacing_mm}</text>'
-        if heel:
-            yy=base_y+10; rebar+="".join(f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{min(heel_end-8,xx+35):.1f}" y2="{yy:.1f}" stroke="#be3343" stroke-width="2"/>' for xx in range(int(stem_back+12),int(heel_end-14),30)); rebar+=f'<text x="{stem_back+10:.1f}" y="{yy+24:.1f}" class="label">Heel: D{heel.bar_diameter_mm:.0f}@{heel.spacing_mm}</text>'
-        if toe:
-            yy=slab_bottom-10; rebar+="".join(f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{min(stem_front-8,xx+28):.1f}" y2="{yy:.1f}" stroke="#be3343" stroke-width="2"/>' for xx in range(int(toe_x+10),int(stem_front-12),26)); rebar+=f'<text x="{toe_x+4:.1f}" y="{yy-9:.1f}" class="label">Toe: D{toe.bar_diameter_mm:.0f}@{toe.spacing_mm}</text>'
-    return f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Proportional retaining-wall cross-section" class="eng-svg" style="width:100%;height:auto;display:block">
-    <style>.eng-svg{{font-family:Arial,sans-serif;background:#fff}}.label{{font-size:13px;fill:#31445a}}.water{{font-size:12px;fill:#0877aa;font-weight:600}}.dim{{font-size:12px;fill:#5e7085}}.ground{{stroke:#68727d;stroke-width:2.2;fill:none}}</style>
-    <title>Retaining wall geometry</title><desc>Cross-section generated from wall input, including retained soil, water table, optional stiffener and shear key.</desc>
-    <rect width="{width}" height="{height}" fill="#fbfcfe"/><path d="M {stem_back:.1f} {base_y:.1f} L {stem_back:.1f} {top_y:.1f} L {width-28:.1f} {terrain_end_y:.1f} L {width-28:.1f} {base_y:.1f} Z" fill="#e7d8ae" opacity=".72"/>
-    <path d="M {stem_back:.1f} {top_y:.1f} L {width-28:.1f} {terrain_end_y:.1f}" class="ground"/><path d="M {toe_x-12:.1f} {front_ground_y:.1f} L {stem_front:.1f} {front_ground_y:.1f}" class="ground"/>
-    <rect x="{toe_x:.1f}" y="{base_y:.1f}" width="{d.base_width*sx:.1f}" height="{d.base_thickness*sy:.1f}" fill="#c7d2d9" stroke="#465765" stroke-width="2"/><path d="M {wall_poly} Z" fill="#c7d2d9" stroke="#465765" stroke-width="2"/>
-    {stiffener}{key}{water}{layers}{surcharge}{actions}{rebar}
-    <line x1="{toe_x:.1f}" y1="{top_y:.1f}" x2="{toe_x:.1f}" y2="{base_y:.1f}" stroke="#8d9baa" stroke-width="1.3" stroke-dasharray="3 3"/><line x1="{toe_x-8:.1f}" y1="{top_y:.1f}" x2="{toe_x+8:.1f}" y2="{top_y:.1f}" stroke="#8d9baa"/><line x1="{toe_x-8:.1f}" y1="{base_y:.1f}" x2="{toe_x+8:.1f}" y2="{base_y:.1f}" stroke="#8d9baa"/><text x="{toe_x-52:.1f}" y="{(top_y+base_y)/2:.1f}" class="dim">H = {h:.2f} m</text>
-    <text x="{stem_front-8:.1f}" y="{top_y-12:.1f}" class="label">Stem</text><text x="{(toe_x+stem_front)/2-10:.1f}" y="{slab_bottom+30:.1f}" class="label">Toe</text><text x="{(stem_back+heel_end)/2-12:.1f}" y="{slab_bottom+30:.1f}" class="label">Heel</text><text x="{width-170}" y="{max(30,terrain_end_y-10):.1f}" class="label">Retained terrain</text><text x="{toe_x-10:.1f}" y="{front_ground_y-10:.1f}" class="label">Front soil</text>
-    <rect x="{width-245}" y="{height-42}" width="12" height="12" fill="#c7d2d9"/><text x="{width-228}" y="{height-31}" class="dim">Concrete</text><rect x="{width-148}" y="{height-42}" width="12" height="12" fill="#e7d8ae"/><text x="{width-130}" y="{height-31}" class="dim">Soil</text></svg>'''
+        k = d.shear_key
+        xk = x_toe + (k.x_from_toe-k.thickness/2) * scale
+        parts.append(f'<rect x="{xk:.1f}" y="{y_bottom:.1f}" width="{k.thickness*scale:.1f}" height="{k.depth*scale:.1f}" fill="white" stroke="#27313b" stroke-width="2"/><text x="{xk-4:.1f}" y="{y_bottom+k.depth*scale+18:.1f}" class="small">shear key</text>')
+    if d.groundwater.behind_depth is not None:
+        yw = y_top + d.groundwater.behind_depth * scale
+        parts.append(f'<line x1="{x_top_back:.1f}" y1="{yw:.1f}" x2="{x_soil_end:.1f}" y2="{yw:.1f}" class="water"/><text x="{x_soil_end-160:.1f}" y="{yw-7:.1f}" class="label" fill="#008ea0">GWT behind EL {d.base_top_elevation+d.wall_height-d.groundwater.behind_depth:.2f} m</text>')
+    if d.groundwater.front_depth is not None:
+        yw = y_front + d.groundwater.front_depth * scale
+        parts.append(f'<line x1="38" y1="{yw:.1f}" x2="{x_front:.1f}" y2="{yw:.1f}" class="water"/><text x="48" y="{yw-8:.1f}" class="label" fill="#008ea0">front water EL {d.front_soil_elevation-d.groundwater.front_depth:.2f} m</text>')
+    if d.surcharge_kpa:
+        ya = max(92.0, min(y_top, y_soil_end)-30.0)
+        x1, x2 = x_top_back+50, min(x_soil_end-10, x_top_back+230)
+        parts.append(f'<line x1="{x1:.1f}" y1="{ya:.1f}" x2="{x2:.1f}" y2="{ya:.1f}" class="ground"/><text x="{x1:.1f}" y="{ya-9:.1f}" class="label">q = {d.surcharge_kpa:.1f} kPa</text>')
+        for xx in range(int(x1+12), int(x2), 28):
+            parts.append(f'<path d="M {xx} {ya:.1f} L {xx} {ya+20:.1f} m -4 -5 l 4 5 l 4 -5" class="ground"/>')
+    # Reference levels and dimension chains.
+    parts.append(f'<line x1="{x_toe-48:.1f}" y1="{y_top:.1f}" x2="{x_toe-48:.1f}" y2="{y_base:.1f}" stroke="#9b5b18"/><line x1="{x_toe-54:.1f}" y1="{y_top:.1f}" x2="{x_toe-42:.1f}" y2="{y_top:.1f}" stroke="#9b5b18"/><line x1="{x_toe-54:.1f}" y1="{y_base:.1f}" x2="{x_toe-42:.1f}" y2="{y_base:.1f}" stroke="#9b5b18"/><text x="{x_toe-120:.1f}" y="{(y_top+y_base)/2:.1f}" class="dim">H = {d.wall_height:.2f} m</text>')
+    parts.append(f'<text x="{x_heel+13:.1f}" y="{y_bottom+4:.1f}" class="small">bottom base EL {d.base_top_elevation-d.base_thickness:.2f} m</text>')
+    y_dim = min(620.0, y_bottom+76.0)
+    for xa, xb, value, name in ((x_toe,x_front,d.toe_width,'toe'),(x_front,x_back,d.stem_thickness_base,'stem'),(x_back,x_heel,d.heel_width,'heel')):
+        parts.append(f'<line x1="{xa:.1f}" y1="{y_bottom+8:.1f}" x2="{xa:.1f}" y2="{y_dim+10:.1f}" stroke="#aaa"/><line x1="{xa:.1f}" y1="{y_dim:.1f}" x2="{xb:.1f}" y2="{y_dim:.1f}" stroke="#9b5b18"/><text x="{(xa+xb)/2:.1f}" y="{y_dim-6:.1f}" text-anchor="middle" class="dim">{value:.2f}</text><text x="{(xa+xb)/2:.1f}" y="{y_dim+13:.1f}" text-anchor="middle" class="small">{name}</text>')
+    parts.append(f'<line x1="{x_heel:.1f}" y1="{y_bottom+8:.1f}" x2="{x_heel:.1f}" y2="{y_dim+10:.1f}" stroke="#aaa"/><text x="{(x_toe+x_heel)/2:.1f}" y="{y_dim+26:.1f}" text-anchor="middle" class="dim">B = {d.base_width:.2f} m</text>')
+    if result:
+        values = {f.name:f for f in result.forces}
+        earth = sum(max(0.0, values[name].horizontal_kn) for name in ("active effective-soil pressure","surcharge lateral pressure","seismic earth-pressure increment") if name in values)
+        water = values.get("behind hydrostatic pressure")
+        front = values.get("front hydrostatic resistance")
+        for yy, label, color, direction in ((y_top+.62*d.wall_height*scale,f'P earth = {earth:.1f} kN/m','#d33b3b',-1),(y_top+.79*d.wall_height*scale,f'P water = {water.horizontal_kn:.1f} kN/m' if water else '', '#10a6b8',-1),(y_base-27.0,f'P front water = {abs(front.horizontal_kn):.1f} kN/m' if front else '', '#10a6b8',1)):
+            if label:
+                anchor = x_back+45 if direction==-1 else x_front-45
+                tip = x_back+5 if direction==-1 else x_front-5
+                parts.append(f'<path d="M {anchor:.1f} {yy:.1f} L {tip:.1f} {yy:.1f} m {-direction*6} -4 l {direction*6} 4 l {-direction*6} 4" fill="none" stroke="{color}" stroke-width="1.5"/><text x="{anchor+8 if direction==-1 else 55:.1f}" y="{yy-7:.1f}" class="small">{label}</text>')
+    parts.append(f'<line x1="34" y1="642" x2="{34+scale:.1f}" y2="642" stroke="#222" stroke-width="2"/><line x1="34" y1="636" x2="34" y2="648" stroke="#222"/><line x1="{34+scale:.1f}" y1="636" x2="{34+scale:.1f}" y2="648" stroke="#222"/><text x="34" y="661" class="small">1 m section scale</text></svg>')
+    return _svg_document(parts)
+
+
+def _svg_reinforcement_section(d: RetainingWallInput, reinforcement: list[RCDesign]) -> str:
+    """Section-scale concrete outline and indicative primary reinforcement routes."""
+    width, height, x_toe, y_base = 1050, 620, 250.0, 452.0
+    scale = min(47.0, 320.0 / max(d.wall_height, .01), 430.0 / max(d.base_width, .01))
+    x_front = x_toe+d.toe_width*scale
+    x_back = x_front+d.stem_thickness_base*scale
+    x_top_back = x_front+d.stem_thickness_top*scale
+    x_heel = x_toe+d.base_width*scale
+    y_top = y_base-d.wall_height*scale
+    y_bottom = y_base+d.base_thickness*scale
+    cover = d.concrete.cover_mm/1000*scale
+    x_stem_bar_top = x_top_back-cover
+    x_stem_bar_bottom = x_back-cover
+    y_heel_bar = y_base+cover
+    y_toe_bar = y_bottom-cover
+    schedule = {item.component:item for item in reinforcement}
+    items = [f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Scale-consistent indicative reinforcement section" style="width:100%;height:auto;display:block;background:white"><style>text{{font-family:Arial,sans-serif;fill:#263238}}.title{{font-size:19px;font-weight:700}}.label{{font-size:13px}}.small{{font-size:11px}}.bar{{stroke:#bc2837;stroke-width:2.6;fill:none}}.lead{{stroke:#bc2837;stroke-width:1.2;fill:none}}</style><rect x="1" y="1" width="{width-2}" height="{height-2}" fill="white" stroke="#444" stroke-width="1.5"/><text x="28" y="38" class="title">REINFORCEMENT — SECTION LAYOUT</text><text x="28" y="58" class="small">Concrete geometry to one scale in both axes. Bar line thickness and bends are diagrammatic.</text><rect x="{x_toe:.1f}" y="{y_base:.1f}" width="{d.base_width*scale:.1f}" height="{d.base_thickness*scale:.1f}" fill="white" stroke="#27313b" stroke-width="2"/><path d="M {x_front:.1f} {y_base:.1f} L {x_back:.1f} {y_base:.1f} L {x_top_back:.1f} {y_top:.1f} L {x_front:.1f} {y_top:.1f} Z" fill="white" stroke="#27313b" stroke-width="2"/>''']
+    if d.shear_key:
+        k=d.shear_key; xk=x_toe+(k.x_from_toe-k.thickness/2)*scale
+        items.append(f'<rect x="{xk:.1f}" y="{y_bottom:.1f}" width="{k.thickness*scale:.1f}" height="{k.depth*scale:.1f}" fill="white" stroke="#27313b" stroke-width="2"/>')
+    if d.stiffener:
+        s=d.stiffener; side=x_back if s.side=="heel" else x_front; direction=1 if s.side=="heel" else -1
+        items.append(f'<path d="M {side:.1f} {y_base:.1f} L {side+direction*s.depth_base*scale:.1f} {y_base:.1f} L {side+direction*s.depth_top*scale:.1f} {y_base-s.constant_depth_to_elevation*scale:.1f} L {side+direction*s.depth_top*scale:.1f} {y_base-s.top_elevation*scale:.1f}" stroke="#777" stroke-width="1.3" stroke-dasharray="5 4" fill="none"/>')
+    stem = schedule.get('stem')
+    if stem:
+        items.append(f'<path d="M {x_stem_bar_top:.1f} {y_top+cover:.1f} L {x_stem_bar_bottom:.1f} {y_base+cover:.1f} L {x_stem_bar_bottom+max(15,4*cover):.1f} {y_base+cover:.1f}" class="bar"/><path d="M {x_stem_bar_top+3:.1f} {y_top+55:.1f} L 730 115" class="lead"/><text x="737" y="112" class="label">Stem retained face: D{stem.bar_diameter_mm:.0f} @ {stem.spacing_mm} mm</text>')
+    heel = schedule.get('heel slab')
+    if heel:
+        items.append(f'<path d="M {x_back-cover:.1f} {y_heel_bar:.1f} L {x_heel-cover:.1f} {y_heel_bar:.1f}" class="bar"/><path d="M {(x_back+x_heel)/2:.1f} {y_heel_bar:.1f} L 730 258" class="lead"/><text x="737" y="255" class="label">Heel top: D{heel.bar_diameter_mm:.0f} @ {heel.spacing_mm} mm</text>')
+    toe = schedule.get('toe slab')
+    if toe:
+        items.append(f'<path d="M {x_toe+cover:.1f} {y_toe_bar:.1f} L {x_front+cover:.1f} {y_toe_bar:.1f}" class="bar"/><path d="M {(x_toe+x_front)/2:.1f} {y_toe_bar:.1f} L 730 357" class="lead"/><text x="737" y="354" class="label">Toe bottom: D{toe.bar_diameter_mm:.0f} @ {toe.spacing_mm} mm</text>')
+    items.append(f'<text x="{x_toe:.1f}" y="{y_bottom+38:.1f}" class="small">Toe</text><text x="{x_heel-35:.1f}" y="{y_bottom+38:.1f}" class="small">Heel</text><text x="700" y="430" class="small">Cover input: {d.concrete.cover_mm:.0f} mm</text><text x="700" y="450" class="small">Anchorage, laps, and transverse steel</text><text x="700" y="466" class="small">require separate detailing.</text><line x1="30" y1="571" x2="{30+scale:.1f}" y2="571" stroke="#222" stroke-width="2"/><line x1="30" y1="565" x2="30" y2="577" stroke="#222"/><line x1="{30+scale:.1f}" y1="565" x2="{30+scale:.1f}" y2="577" stroke="#222"/><text x="30" y="593" class="small">1 m section scale</text></svg>')
+    return _svg_document(items)
 
 
 def _pressure_profile(d: RetainingWallInput, count: int = 31) -> list[tuple[float,float,float,float,float]]:
@@ -425,22 +487,24 @@ def _pressure_profile(d: RetainingWallInput, count: int = 31) -> list[tuple[floa
 
 
 def _svg_stress_diagrams(result: CalculationResult) -> str:
-    d=result.input; pts=_pressure_profile(d); width,height=760,420; x0,y0,plot_h=92,58,225
-    pmax=max(1,max(sum(x[1:]) for x in pts)); scale=250/pmax
-    path=lambda index: " ".join(f"{x0+v[index]*scale:.1f},{y0+v[0]/d.wall_height*plot_h:.1f}" for v in pts)
-    total=" ".join(f"{x0+sum(v[1:])*scale:.1f},{y0+v[0]/d.wall_height*plot_h:.1f}" for v in pts)
-    fill=f"{x0},{y0} {total} {x0},{y0+plot_h}"
-    trace=next((x.values for x in result.trace.items if x.step=="Bearing capacity"),{})
-    qtoe=float(trace.get("qtoe_kPa",0));qheel=float(trace.get("qheel_kPa",0));qmax=max(1,abs(qtoe),abs(qheel)); bx1,bx2,by=430,690,352; qscale=72/qmax
-    return f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Lateral stress and base contact-pressure diagrams" class="eng-svg" style="width:100%;height:auto;display:block"><style>.eng-svg{{font-family:Arial,sans-serif;background:#fff}}.axis{{stroke:#546273;stroke-width:1.5}}.grid{{stroke:#dce3ea;stroke-width:1}}.txt{{font-size:12px;fill:#36485e}}.small{{font-size:11px;fill:#66778b}}.head{{font-size:14px;fill:#24384e;font-weight:600}}</style><title>Working stress diagrams</title><desc>Calculated retained-side lateral-pressure distribution and base contact-pressure distribution.</desc>
-    <rect width="{width}" height="{height}" fill="#fbfcfe"/><text x="{x0}" y="25" class="head">Retained-side lateral pressure</text><text x="{x0}" y="43" class="small">Depth below retained top [m] • pressure [kPa]</text>
-    <line x1="{x0}" y1="{y0}" x2="{x0}" y2="{y0+plot_h}" class="axis"/><line x1="{x0}" y1="{y0+plot_h}" x2="{x0+270}" y2="{y0+plot_h}" class="axis"/>
-    <line x1="{x0}" y1="{y0+plot_h/2}" x2="{x0+270}" y2="{y0+plot_h/2}" class="grid"/><text x="{x0-40}" y="{y0+5}" class="small">0.0</text><text x="{x0-40}" y="{y0+plot_h/2+5}" class="small">{d.wall_height/2:.1f}</text><text x="{x0-40}" y="{y0+plot_h+5}" class="small">{d.wall_height:.1f}</text>
-    <polygon points="{fill}" fill="#d46a3a33" stroke="#c7532d" stroke-width="2"/><polyline points="{path(1)}" fill="none" stroke="#6d8193" stroke-width="1.5" stroke-dasharray="5 3"/><polyline points="{path(2)}" fill="none" stroke="#c69720" stroke-width="1.5" stroke-dasharray="3 3"/><polyline points="{path(3)}" fill="none" stroke="#8955a5" stroke-width="1.5" stroke-dasharray="6 3"/><polyline points="{path(4)}" fill="none" stroke="#1688b8" stroke-width="1.8"/>
-    <rect x="{x0}" y="{y0+plot_h+20}" width="10" height="10" fill="#d46a3a"/><text x="{x0+15}" y="{y0+plot_h+30}" class="small">Total</text><line x1="{x0+76}" y1="{y0+plot_h+25}" x2="{x0+91}" y2="{y0+plot_h+25}" stroke="#6d8193" stroke-width="2"/><text x="{x0+96}" y="{y0+plot_h+30}" class="small">Soil</text><line x1="{x0+145}" y1="{y0+plot_h+25}" x2="{x0+160}" y2="{y0+plot_h+25}" stroke="#1688b8" stroke-width="2"/><text x="{x0+165}" y="{y0+plot_h+30}" class="small">Water</text>
-    <text x="{bx1}" y="25" class="head">Base contact pressure</text><text x="{bx1}" y="43" class="small">Service resultant • q at toe and heel [kPa]</text><line x1="{bx1}" y1="{by}" x2="{bx2}" y2="{by}" class="axis"/><polygon points="{bx1},{by} {bx1},{by-qtoe*qscale:.1f} {bx2},{by-qheel*qscale:.1f} {bx2},{by}" fill="#347d9b33" stroke="#20627d" stroke-width="2"/>
-    <text x="{bx1-2}" y="{by+20}" class="txt">Toe</text><text x="{bx2-22}" y="{by+20}" class="txt">Heel</text><text x="{bx1+4}" y="{by-qtoe*qscale-8:.1f}" class="txt">{qtoe:.1f}</text><text x="{bx2-36}" y="{by-qheel*qscale-8:.1f}" class="txt">{qheel:.1f}</text><line x1="{bx1}" y1="{by+36}" x2="{bx2}" y2="{by+36}" stroke="#8c99a8" stroke-width="1"/><text x="{(bx1+bx2)/2-35}" y="{by+54}" class="small">Base width B</text>
-    <text x="{bx1}" y="{by+84}" class="small">Positive values indicate compressive contact. Review no-tension and bearing checks.</text></svg>'''
+    d = result.input
+    pts = _pressure_profile(d)
+    width, height, y_top, plot_h = 1180, 470, 104.0, 250.0
+    p_max = max(1.0, *(v[i] for v in pts for i in range(1, 5)))
+    p_scale = 145.0 / p_max
+    parts = [f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Line diagrams for lateral stress and base pressure" style="width:100%;height:auto;display:block;background:white"><style>text{{font-family:Arial,sans-serif;fill:#263238}}.title{{font-size:19px;font-weight:700}}.small{{font-size:11px}}.label{{font-size:13px}}.axis{{stroke:#555;stroke-width:1.2}}.grid{{stroke:#bbb;stroke-width:1;stroke-dasharray:4 4}}</style><rect x="1" y="1" width="{width-2}" height="{height-2}" fill="white" stroke="#444" stroke-width="1.5"/><text x="28" y="36" class="title">PRESSURE DIAGRAMS — CALCULATED LOAD CASE</text><text x="28" y="56" class="small">All lateral pressure ordinates share one horizontal scale; depth uses the wall-height scale. Values in kPa.</text>''']
+    panels = ((84.0,1,'Effective soil','#d33b3b'),(300.0,2,'Surcharge','#d33b3b'),(516.0,3,'Seismic increment','#a44782'),(732.0,4,'Hydrostatic water','#10a6b8'))
+    for x0, index, label, color in panels:
+        coords = ' '.join(f'{x0+v[index]*p_scale:.1f},{y_top+v[0]/d.wall_height*plot_h:.1f}' for v in pts)
+        peak = max(v[index] for v in pts)
+        parts.append(f'<text x="{x0:.1f}" y="84" class="label">{label}</text><line x1="{x0:.1f}" y1="{y_top:.1f}" x2="{x0:.1f}" y2="{y_top+plot_h:.1f}" class="axis"/><line x1="{x0:.1f}" y1="{y_top+plot_h:.1f}" x2="{x0+150:.1f}" y2="{y_top+plot_h:.1f}" class="axis"/><line x1="{x0:.1f}" y1="{y_top+plot_h/2:.1f}" x2="{x0+150:.1f}" y2="{y_top+plot_h/2:.1f}" class="grid"/><polyline points="{coords}" fill="none" stroke="{color}" stroke-width="2"/><text x="{x0:.1f}" y="{y_top+plot_h+22:.1f}" class="small">peak {peak:.1f} kPa</text>')
+    trace = next((item.values for item in result.trace.items if item.step == 'Bearing capacity'), {})
+    q_toe, q_heel = float(trace.get('qtoe_kPa', 0)), float(trace.get('qheel_kPa', 0))
+    x1, x2, y0 = 963.0, 1115.0, 354.0
+    q_scale = 150.0/max(1.0,abs(q_toe),abs(q_heel))
+    parts.append(f'<text x="{x1:.1f}" y="84" class="label">Base contact</text><text x="{x1:.1f}" y="101" class="small">q [kPa]</text><line x1="{x1:.1f}" y1="{y0:.1f}" x2="{x2:.1f}" y2="{y0:.1f}" class="axis"/><path d="M {x1:.1f} {y0:.1f} L {x1:.1f} {y0-q_toe*q_scale:.1f} L {x2:.1f} {y0-q_heel*q_scale:.1f} L {x2:.1f} {y0:.1f}" stroke="#c44836" stroke-width="2" fill="none"/><text x="{x1:.1f}" y="{y0+50:.1f}" class="small">toe {q_toe:.1f}</text><text x="{x1:.1f}" y="{y0+68:.1f}" class="small">heel {q_heel:.1f}</text>')
+    parts.append(f'<text x="28" y="421" class="small">Depth 0 at retained ground; wall base at {d.wall_height:.2f} m. Lateral diagrams show behind-wall pressure components; opposing front water and key resistance are in the action table.</text><text x="28" y="444" class="small">Pressure scale: {p_max:.1f} kPa = 145 drawing units. Base-contact scale is separate.</text></svg>')
+    return _svg_document(parts)
 
 
 # ---------- Streamlit user interface ----------
@@ -521,7 +585,10 @@ def streamlit_app() -> None:
             st.number_input("Stem thickness at base [m]", min_value=.10, value=.65, step=.05, key="stem_base")
         with c3:
             st.selectbox("Retained-side terrain", [x.value for x in TerrainKind], format_func=lambda x: {"flat":"Flat", "infinite_slope":"Infinite slope", "flat_then_infinite_slope":"Flat length then infinite slope"}[x], key="terrain_kind")
-            st.number_input("Slope angle [deg]", min_value=0.0, max_value=50.0, value=8.0, step=.5, key="slope")
+            _is_flat_terrain = st.session_state.get("terrain_kind") == TerrainKind.FLAT.value
+            st.number_input("Slope angle [deg]", min_value=0.0, max_value=50.0, value=8.0, step=.5, key="slope", disabled=_is_flat_terrain)
+            if _is_flat_terrain:
+                st.caption("Flat selected: the analysis uses β = 0°. Any previously entered slope is ignored.")
             st.number_input("Initial flat length L [m]", min_value=0.0, value=4.0, step=.25, key="flat_len", disabled=st.session_state.get("terrain_kind") != "flat_then_infinite_slope")
         st.divider(); st.subheader("Stiffener / shear key")
         k1,k2 = st.columns(2)
@@ -558,7 +625,8 @@ def streamlit_app() -> None:
         st.info("Hydrostatic pressures on both faces are included. Uplift, drainage flow, custom pore-pressure profiles, capillary action, and hydrodynamic water require a project-specific assessment.")
         try:
             _base_top=st.session_state.base_bottom_el+st.session_state.base_t
-            _preview=RetainingWallInput(wall_height=st.session_state.retained_el-_base_top,base_top_elevation=_base_top,retained_top_elevation=st.session_state.retained_el,front_soil_elevation=st.session_state.front_el,stem_thickness_top=st.session_state.stem_top,stem_thickness_base=st.session_state.stem_base,toe_width=st.session_state.toe,heel_width=st.session_state.heel,base_thickness=st.session_state.base_t,soils=_streamlit_soil_layers(rear),front_soils=_streamlit_soil_layers(front),terrain=Terrain(TerrainKind(st.session_state.terrain_kind),st.session_state.slope,st.session_state.flat_len),groundwater=Groundwater(st.session_state.retained_el-st.session_state.gwt_back_el if st.session_state.gwt_back_on else None,st.session_state.front_el-st.session_state.gwt_front_el if st.session_state.gwt_front_on else None,st.session_state.gamma_w))
+            _terrain_kind=TerrainKind(st.session_state.terrain_kind); _terrain_slope=0.0 if _terrain_kind is TerrainKind.FLAT else st.session_state.slope
+            _preview=RetainingWallInput(wall_height=st.session_state.retained_el-_base_top,base_top_elevation=_base_top,retained_top_elevation=st.session_state.retained_el,front_soil_elevation=st.session_state.front_el,stem_thickness_top=st.session_state.stem_top,stem_thickness_base=st.session_state.stem_base,toe_width=st.session_state.toe,heel_width=st.session_state.heel,base_thickness=st.session_state.base_t,soils=_streamlit_soil_layers(rear),front_soils=_streamlit_soil_layers(front),terrain=Terrain(_terrain_kind,_terrain_slope,st.session_state.flat_len),groundwater=Groundwater(st.session_state.retained_el-st.session_state.gwt_back_el if st.session_state.gwt_back_on else None,st.session_state.front_el-st.session_state.gwt_front_el if st.session_state.gwt_front_on else None,st.session_state.gamma_w))
             st.subheader("Live geometry and layering illustration")
             st.caption("All elevations use the project datum: bottom base slab, top base slab, backfill, front/excavation, and water levels are shown explicitly.")
             st.markdown(_svg_wall_section(_preview),unsafe_allow_html=True)
@@ -604,7 +672,8 @@ def streamlit_app() -> None:
             if ss.stiff_type != "None":
                 stiffener=Stiffener("heel" if ss.stiff_type.startswith("Counterfort") else "toe",ss.stiff_spacing,ss.stiff_t,ss.stiff_top,ss.stiff_const,ss.stiff_top_d,ss.stiff_base_d)
             key=ShearKey(ss.key_d,ss.key_t,ss.key_x) if ss.key_on else None
-            inp=RetainingWallInput(wall_height=h,base_top_elevation=base_top,retained_top_elevation=ss.retained_el,front_soil_elevation=ss.front_el,stem_thickness_top=ss.stem_top,stem_thickness_base=ss.stem_base,toe_width=ss.toe,heel_width=ss.heel,base_thickness=ss.base_t,soils=_streamlit_soil_layers(rear),front_soils=_streamlit_soil_layers(front),terrain=Terrain(TerrainKind(ss.terrain_kind),ss.slope,ss.flat_len),groundwater=Groundwater(ss.retained_el-ss.gwt_back_el if ss.gwt_back_on else None,ss.front_el-ss.gwt_front_el if ss.gwt_front_on else None,ss.gamma_w),surcharge_kpa=ss.surcharge,base_friction_angle_deg=None,adhesion_kpa=0.0,allowable_bearing_kpa=None,include_passive_front=ss.passive_on,passive_reduction=ss.passive_red,shear_key=key,stiffener=stiffener,concrete=Concrete(ss.fc,ss.fy,ss.conc_g,ss.cover,ss.bar_d),global_stability=GlobalStabilityInput(ss.global_fs if ss.global_on else None,ss.global_req,"user-supplied external result"),required_sliding_fs=ss.fs_slide,required_overturning_fs=ss.fs_ot,strength_load_factor=ss.strength_factor,strength_mode="drained" if ss.strength_mode_ui.startswith("Drained") else "undrained",shear_strength_reduction=ss.shear_red,base_interface_factor=ss.base_interface,undrained_adhesion_factor=ss.alpha_adh,foundation_embedment_m=ss.embedment,bearing_safety_factor=ss.bearing_fs,pga_m_g=ss.pga_m,pga_reduction_factor=ss.pga_red,return_period_years=ss.return_period,vertical_to_horizontal_ratio=ss.kvkh,include_hydrodynamic_water=ss.hydro_dynamic)
+            _terrain_kind=TerrainKind(ss.terrain_kind); _terrain_slope=0.0 if _terrain_kind is TerrainKind.FLAT else ss.slope
+            inp=RetainingWallInput(wall_height=h,base_top_elevation=base_top,retained_top_elevation=ss.retained_el,front_soil_elevation=ss.front_el,stem_thickness_top=ss.stem_top,stem_thickness_base=ss.stem_base,toe_width=ss.toe,heel_width=ss.heel,base_thickness=ss.base_t,soils=_streamlit_soil_layers(rear),front_soils=_streamlit_soil_layers(front),terrain=Terrain(_terrain_kind,_terrain_slope,ss.flat_len),groundwater=Groundwater(ss.retained_el-ss.gwt_back_el if ss.gwt_back_on else None,ss.front_el-ss.gwt_front_el if ss.gwt_front_on else None,ss.gamma_w),surcharge_kpa=ss.surcharge,base_friction_angle_deg=None,adhesion_kpa=0.0,allowable_bearing_kpa=None,include_passive_front=ss.passive_on,passive_reduction=ss.passive_red,shear_key=key,stiffener=stiffener,concrete=Concrete(ss.fc,ss.fy,ss.conc_g,ss.cover,ss.bar_d),global_stability=GlobalStabilityInput(ss.global_fs if ss.global_on else None,ss.global_req,"user-supplied external result"),required_sliding_fs=ss.fs_slide,required_overturning_fs=ss.fs_ot,strength_load_factor=ss.strength_factor,strength_mode="drained" if ss.strength_mode_ui.startswith("Drained") else "undrained",shear_strength_reduction=ss.shear_red,base_interface_factor=ss.base_interface,undrained_adhesion_factor=ss.alpha_adh,foundation_embedment_m=ss.embedment,bearing_safety_factor=ss.bearing_fs,pga_m_g=ss.pga_m,pga_reduction_factor=ss.pga_red,return_period_years=ss.return_period,vertical_to_horizontal_ratio=ss.kvkh,include_hydrodynamic_water=ss.hydro_dynamic)
             st.session_state["rw_result"]=RetainingWallEngine().run(inp);st.session_state["rw_error"]=None
         except Exception as exc: st.session_state["rw_error"]=str(exc)
 
@@ -617,10 +686,16 @@ def streamlit_app() -> None:
             checks={x.name:x for x in result.checks}; slide=checks["sliding"];ot=checks["overturning"]; bearing=checks.get("allowable bearing")
             m1,m2,m3,m4=st.columns(4);m1.metric("Overall status","PASS" if result.passed else "REVIEW");m2.metric("Sliding FS",f"{slide.ratio_or_fs:.2f}",f"Required ≥ {slide.required:.2f}");m3.metric("Overturning FS",f"{ot.ratio_or_fs:.2f}",f"Required ≥ {ot.required:.2f}");m4.metric("Max bearing",f"{bearing.demand:.1f} kPa" if bearing else "Not set",f"Allowable {bearing.capacity:.1f} kPa" if bearing else None)
             st.divider(); st.subheader("Geometry and working-stress diagrams")
-            st.caption("Proportional cross-section from active wall geometry")
-            st.markdown(_svg_wall_section(result.input, result.reinforcement), unsafe_allow_html=True)
-            st.caption("Calculated pressure distributions from the active load case")
+            st.caption("Line drawing with one scale in both geometry axes, levels, soil layers, water, actions, and dimensions")
+            st.markdown(_svg_wall_section(result.input, result), unsafe_allow_html=True)
+            st.caption("Calculated pressure ordinates; equal horizontal pressure scale across components")
             st.markdown(_svg_stress_diagrams(result), unsafe_allow_html=True)
+            st.caption("Indicative section layout of the calculated primary reinforcement")
+            st.markdown(_svg_reinforcement_section(result.input, result.reinforcement), unsafe_allow_html=True)
+            f1,f2,f3=st.columns(3)
+            with f1: st.download_button("Download analysis section (SVG)",_svg_wall_section(result.input,result),file_name="wall_analysis_section.svg",mime="image/svg+xml",width="stretch")
+            with f2: st.download_button("Download pressure diagrams (SVG)",_svg_stress_diagrams(result),file_name="wall_pressure_diagrams.svg",mime="image/svg+xml",width="stretch")
+            with f3: st.download_button("Download reinforcement drawing (SVG)",_svg_reinforcement_section(result.input,result.reinforcement),file_name="wall_reinforcement.svg",mime="image/svg+xml",width="stretch")
             st.divider();st.subheader("External stability checks")
             check_rows=[{"Check":x.name,"Demand":round(x.demand,3),"Capacity":None if x.capacity is None else round(x.capacity,3),"FS / ratio":round(x.ratio_or_fs,3),"Required":x.required,"Status":"PASS" if x.ok is True else "FAIL" if x.ok is False else "EXTERNAL"} for x in result.checks];st.dataframe(check_rows,width="stretch",hide_index=True)
             c1,c2=st.columns(2)
