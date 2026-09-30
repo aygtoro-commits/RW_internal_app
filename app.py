@@ -23,8 +23,9 @@ GEO5 = "GEO5 Retaining Wall User Guide (comparison only)"
 REF = {
     "active": (SNI_8460, TEXTBOOK), "seismic": (SNI_8460, FHWA),
     "water": (SNI_8460, FHWA), "stability": (SNI_8460,),
+    "shear_key": (SNI_8460, FHWA, TEXTBOOK),
     "bearing": (SNI_8460, TEXTBOOK), "rc": (SNI_2847, ACI_318),
-    "global": (SNI_8460, FHWA), "geo5": (GEO5,),
+    "global": (SNI_8460, FHWA), "bearing_capacity": (SNI_8460, FHWA, TEXTBOOK), "seismic_water": (SNI_8460, FHWA, TEXTBOOK), "geo5": (GEO5,),
 }
 
 
@@ -69,11 +70,12 @@ class Terrain:
 @dataclass(frozen=True)
 class SoilLayer:
     thickness: float; gamma_dry: float; gamma_sat: float; phi_deg: float
-    cohesion: float = 0.0; interface_delta_deg: float = 0.0
+    cohesion: float = 0.0; interface_delta_deg: float = 0.0; su_kpa: float = 0.0
 
     def __post_init__(self) -> None:
         if min(self.thickness, self.gamma_dry, self.gamma_sat) <= 0: raise ValueError("soil thickness/unit weights must be positive")
         if not 0 < self.phi_deg < 55: raise ValueError("phi_deg must be (0,55)")
+        if self.su_kpa < 0: raise ValueError("undrained Su must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -83,7 +85,9 @@ class Groundwater:
     gamma_water: float = 9.81
 
     def __post_init__(self) -> None:
-        if any(x is not None and x < 0 for x in (self.behind_depth, self.front_depth)): raise ValueError("water depths must be >= 0")
+        # A negative depth is permitted: it represents free water above the
+        # local ground level, e.g. a pond against the front wall face.
+        if self.gamma_water <= 0: raise ValueError("gamma_water must be positive")
 
 
 @dataclass(frozen=True)
@@ -133,18 +137,26 @@ class RetainingWallInput:
     shear_key: ShearKey | None = None; stiffener: Stiffener | None = None; concrete: Concrete = field(default_factory=Concrete)
     global_stability: GlobalStabilityInput = field(default_factory=GlobalStabilityInput)
     required_sliding_fs: float = 1.5; required_overturning_fs: float = 2.0; strength_load_factor: float = 1.6
+    strength_mode: Literal["drained", "undrained"] = "drained"
+    shear_strength_reduction: float = 1.0; base_interface_factor: float = 2/3; undrained_adhesion_factor: float = .5
+    foundation_embedment_m: float = 0.0; bearing_safety_factor: float = 3.0
+    pga_m_g: float | None = None; pga_reduction_factor: float = 1.0; return_period_years: float | None = None; vertical_to_horizontal_ratio: float = 0.0
+    include_hydrodynamic_water: bool = False
 
     def __post_init__(self) -> None:
         if min(self.wall_height, self.stem_thickness_top, self.stem_thickness_base, self.base_thickness) <= 0 or min(self.toe_width, self.heel_width) < 0: raise ValueError("invalid wall dimensions")
         if not self.soils or sum(x.thickness for x in self.soils) + 1e-9 < self.wall_height: raise ValueError("retained-side soil layers must cover wall height")
         if self.retained_top_elevation is not None and abs(self.retained_top_elevation-self.base_top_elevation-self.wall_height) > 1e-6: raise ValueError("retained_top_elevation-base_top_elevation must equal wall_height")
-        if not self.base_top_elevation <= self.front_soil_elevation <= self.base_top_elevation+self.wall_height: raise ValueError("front soil elevation must be between base and retained top")
+        if not self.base_top_elevation-self.base_thickness <= self.front_soil_elevation <= self.base_top_elevation+self.wall_height: raise ValueError("front soil elevation must be between base-slab bottom and retained top")
         if self.front_soils and sum(x.thickness for x in self.front_soils) + 1e-9 < self.front_soil_height: raise ValueError("front-side layers must cover front soil height")
         if self.kh < 0 or not -.5 < self.kv < .5: raise ValueError("invalid pseudo-static coefficients")
         if self.shear_key and self.shear_key.x_from_toe > self.base_width: raise ValueError("shear key must lie within base")
         if self.stiffener:
             if self.stiffener.top_elevation > self.wall_height: raise ValueError("stiffener top exceeds wall")
             if max(self.stiffener.depth_top, self.stiffener.depth_base) > (self.heel_width if self.stiffener.side == "heel" else self.toe_width): raise ValueError("stiffener exceeds its projection")
+        if self.strength_mode not in ("drained", "undrained"): raise ValueError("strength_mode must be drained or undrained")
+        if not 0 < self.shear_strength_reduction <= 1 or not 0 <= self.base_interface_factor <= 1 or not 0 <= self.undrained_adhesion_factor <= 1: raise ValueError("invalid strength/interface reduction factor")
+        if min(self.foundation_embedment_m, self.bearing_safety_factor, self.pga_reduction_factor) < 0: raise ValueError("invalid bearing or PGA input")
 
     @property
     def base_width(self) -> float: return self.toe_width+self.stem_thickness_base+self.heel_width
@@ -152,6 +164,10 @@ class RetainingWallInput:
     def front_soil_height(self) -> float: return self.front_soil_elevation-self.base_top_elevation
     @property
     def front_soil_profile(self) -> tuple[SoilLayer, ...]: return self.front_soils or self.soils
+    @property
+    def design_kh(self) -> float: return self.pga_m_g*self.pga_reduction_factor if self.pga_m_g is not None else self.kh
+    @property
+    def design_kv(self) -> float: return self.design_kh*self.vertical_to_horizontal_ratio if self.pga_m_g is not None else self.kv
 
 
 # ---------- Formula helpers ----------
@@ -179,6 +195,17 @@ def mononobe_okabe_kae(phi_deg: float, beta_rad: float, delta_deg: float, kh: fl
     value = cos(phi-theta)**2/(cos(theta)**2*cos(delta+theta)*(1+sqrt(radicand))**2)
     if value <= 0: raise ValueError("non-positive Mononobe-Okabe coefficient")
     return value
+
+
+def design_shear_parameters(layer: SoilLayer, d: RetainingWallInput) -> tuple[float, float, float]:
+    """Return design phi, cohesion, and interface delta after user reduction."""
+    if d.strength_mode == "undrained":
+        return 0.0, layer.su_kpa*d.shear_strength_reduction, 0.0
+    eta=d.shear_strength_reduction
+    phi=atan(eta*tan(radians(layer.phi_deg)))*180/3.141592653589793
+    cohesion=eta*layer.cohesion
+    delta=atan(eta*tan(radians(layer.interface_delta_deg)))*180/3.141592653589793
+    return phi, cohesion, delta
 
 
 # ---------- Result model and engine ----------
@@ -212,10 +239,10 @@ class RetainingWallEngine:
             trace.warn("Broken terrain is conservatively approximated as infinite slope for lateral pressure; final design needs a rigorous wedge model.")
         forces = self._lateral(d, beta, trace)
         vertical = self._vertical(d, beta, trace); forces += vertical
-        if d.kh:
+        if d.design_kh:
             wc = sum(x.vertical_kn for x in vertical if "self weight" in x.name or "stiffener" in x.name)
-            forces.append(Force("seismic inertia of concrete wall", d.kh*wc, 0, 0, d.base_thickness+d.wall_height/2))
-            trace.add("Wall pseudo-static inertia", "Fi=kh*W_concrete", {"kh":d.kh,"Fi_kN_per_m":d.kh*wc}, REF["seismic"], "Soil-wedge inertia is in Mononobe-Okabe.")
+            forces.append(Force("seismic inertia of concrete wall", d.design_kh*wc, 0, 0, d.base_thickness+d.wall_height/2))
+            trace.add("Wall pseudo-static inertia", "Fi=kh*W_concrete", {"PGA_m_g":d.pga_m_g,"PGA_reduction":d.pga_reduction_factor,"return_period_years":d.return_period_years,"kh":d.design_kh,"Fi_kN_per_m":d.design_kh*wc}, REF["seismic"], "kh is derived from PGAm times reduction factor when PGAm is supplied.")
         checks = self._stability(d, forces, trace); reinforcement = self._rc(d, forces, trace)
         g = d.global_stability
         if g.factor_of_safety is None:
@@ -229,19 +256,26 @@ class RetainingWallEngine:
         h, step, z, sv = d.wall_height, min(.025,d.wall_height/400), 0., 0.; ps=ms=pq=mq=pe=me=0.
         while z < h-1e-10:
             dz=min(step,h-z); mid=z+dz/2; soil=layer_at(d.soils,mid)
-            gamma=max(.01,soil.gamma_sat-d.groundwater.gamma_water) if d.groundwater.behind_depth is not None and mid>d.groundwater.behind_depth else soil.gamma_dry
-            svm=sv+gamma*dz/2; sv+=gamma*dz; ka=rankine_ka(soil.phi_deg,beta); pressure=max(0.,ka*svm-2*soil.cohesion*sqrt(ka)); y=h-mid
+            phi,cohesion,delta=design_shear_parameters(soil,d); gamma=soil.gamma_sat if d.strength_mode=="undrained" else (max(.01,soil.gamma_sat-d.groundwater.gamma_water) if d.groundwater.behind_depth is not None and mid>d.groundwater.behind_depth else soil.gamma_dry)
+            svm=sv+gamma*dz/2; sv+=gamma*dz; ka=1.0 if d.strength_mode=="undrained" else rankine_ka(phi,beta); pressure=max(0.,ka*svm-2*cohesion*sqrt(ka)); y=h-mid
             ps+=pressure*dz; ms+=pressure*dz*y; pq+=ka*d.surcharge_kpa*dz; mq+=ka*d.surcharge_kpa*dz*y
-            if d.kh: inc=max(0.,(mononobe_okabe_kae(soil.phi_deg,beta,soil.interface_delta_deg,d.kh,d.kv)-ka)*svm); pe+=inc*dz; me+=inc*dz*y
+            if d.design_kh and d.strength_mode=="drained": inc=max(0.,(mononobe_okabe_kae(phi,beta,delta,d.design_kh,d.design_kv)-ka)*svm); pe+=inc*dz; me+=inc*dz*y
             z+=dz
         out=[Force("active effective-soil pressure",ps,0,0,ms/ps if ps else 0),Force("surcharge lateral pressure",pq,0,0,mq/pq if pq else 0)]
-        t.add("Active earth pressure","sigma_h'=max(0,Ka*sigma_v'-2*c'*sqrt(Ka)); P=integral(sigma_h'dz)",{"Psoil_kN_per_m":ps,"Psurcharge_kN_per_m":pq,"terrain":d.terrain.kind.value},REF["active"])
-        if d.kh: out.append(Force("seismic earth-pressure increment",pe,0,0,me/pe if pe else 0)); t.add("Seismic earth pressure","Delta sigma_h'=(Kae-Ka)*sigma_v'; Kae=Mononobe-Okabe",{"kh":d.kh,"kv":d.kv,"DeltaP_kN_per_m":pe},REF["seismic"]); t.warn("Hydrodynamic seismic-water force and displacement checks are outside this preliminary engine.")
+        t.add("Active earth pressure","sigma_h=max(0,Ka*sigma_v-2*c*sqrt(Ka)); P=integral(sigma_h dz)",{"Psoil_kN_per_m":ps,"Psurcharge_kN_per_m":pq,"strength_mode":d.strength_mode,"shear_reduction":d.shear_strength_reduction,"terrain":d.terrain.kind.value},REF["active"])
+        t.add("Shear-strength reduction","tan(phi_design)=eta*tan(phi_input); c_design=eta*c_input; undrained: Su_design=eta*Su",{"eta":d.shear_strength_reduction,"mode":d.strength_mode},REF["stability"])
+        if d.design_kh and d.strength_mode=="drained": out.append(Force("seismic earth-pressure increment",pe,0,0,me/pe if pe else 0)); t.add("Seismic earth pressure","Delta sigma_h=(Kae-Ka)*sigma_v; Kae=Mononobe-Okabe",{"kh":d.design_kh,"kv":d.design_kv,"DeltaP_kN_per_m":pe},REF["seismic"])
+        elif d.design_kh: t.warn("Mononobe-Okabe is not used for undrained/cohesive total-stress analysis; obtain a project-specific seismic earth-pressure model.")
         if d.groundwater.behind_depth is not None and d.groundwater.behind_depth<h:
             hw=h-d.groundwater.behind_depth; p=.5*d.groundwater.gamma_water*hw**2; out.append(Force("behind hydrostatic pressure",p,0,0,hw/3)); t.add("Behind hydrostatic pressure","Pw=0.5*gamma_w*hw^2",{"Pw_kN_per_m":p},REF["water"])
         if d.groundwater.front_depth is not None:
             hw=max(0.,d.front_soil_height-d.groundwater.front_depth)
             if hw: p=.5*d.groundwater.gamma_water*hw**2; out.append(Force("front hydrostatic resistance",-p,0,0,hw/3)); t.add("Front hydrostatic pressure","Pw=0.5*gamma_w*hw^2 (resisting)",{"Pw_kN_per_m":p},REF["water"])
+        if d.include_hydrodynamic_water and d.design_kh:
+            hb=max(0.,h-(d.groundwater.behind_depth if d.groundwater.behind_depth is not None else h)); hf=max(0.,d.front_soil_height-(d.groundwater.front_depth if d.groundwater.front_depth is not None else d.front_soil_height)); pb=7/12*d.design_kh*d.groundwater.gamma_water*hb**2; pf=7/12*d.design_kh*d.groundwater.gamma_water*hf**2
+            if pb: out.append(Force("seismic hydrodynamic water behind",pb,0,0,.4*hb))
+            if pf: out.append(Force("seismic hydrodynamic water front",-pf,0,0,.4*hf))
+            t.add("Hydrodynamic water","Pwd=(7/12)*kh*gamma_w*Hw^2; y=0.4Hw",{"Pbehind_kN_per_m":pb,"Pfront_kN_per_m":pf},REF["seismic_water"],"Westergaard-type simplified free-water increment; not excess pore pressure in soil.")
         return out
 
     def _vertical(self,d:RetainingWallInput,beta:float,t:CalculationTrace)->list[Force]:
@@ -262,16 +296,20 @@ class RetainingWallEngine:
 
     def _stability(self,d:RetainingWallInput,f:list[Force],t:CalculationTrace)->list[Check]:
         hor=[x for x in f if x.horizontal_kn]; ver=[x for x in f if x.vertical_kn]; drive=sum(max(0,x.horizontal_kn) for x in hor); front=-sum(min(0,x.horizontal_kn) for x in hor); n=sum(x.vertical_kn for x in ver)
-        phi=d.base_friction_angle_deg if d.base_friction_angle_deg is not None else d.soils[-1].phi_deg; friction=n*tan(radians(phi))+d.adhesion_kpa*d.base_width; passive=0.
+        founding=layer_at(d.soils,d.wall_height+d.base_thickness); phi_soil,c_soil,_=design_shear_parameters(founding,d); phi=d.base_friction_angle_deg if d.base_friction_angle_deg is not None else atan(d.base_interface_factor*tan(radians(phi_soil)))*180/3.141592653589793; adhesion=d.adhesion_kpa if d.adhesion_kpa else d.undrained_adhesion_factor*c_soil if d.strength_mode=="undrained" else d.base_interface_factor*c_soil; friction=n*tan(radians(phi))+adhesion*d.base_width; passive=0.
         if d.include_passive_front and d.front_soil_height:
-            soil=d.front_soil_profile[0]; kp=(1+sin(radians(soil.phi_deg)))/(1-sin(radians(soil.phi_deg))); passive+=d.passive_reduction*.5*kp*soil.gamma_dry*d.front_soil_height**2
-            if d.shear_key: soil=d.front_soil_profile[-1];kp=(1+sin(radians(soil.phi_deg)))/(1-sin(radians(soil.phi_deg)));passive+=d.passive_reduction*.5*kp*soil.gamma_dry*d.shear_key.depth**2
+            soil=d.front_soil_profile[0]; pp,cp,_=design_shear_parameters(soil,d); kp=1. if d.strength_mode=="undrained" else (1+sin(radians(pp)))/(1-sin(radians(pp))); passive+=d.passive_reduction*(.5*kp*soil.gamma_dry*d.front_soil_height**2+2*cp*sqrt(kp)*d.front_soil_height)
+            if d.shear_key:
+                soil=d.front_soil_profile[-1];pp,cp,_=design_shear_parameters(soil,d);kp=1. if d.strength_mode=="undrained" else (1+sin(radians(pp)))/(1-sin(radians(pp))); q_key=n/d.base_width
+                key_passive=kp*(q_key*d.shear_key.depth+.5*soil.gamma_dry*d.shear_key.depth**2)+2*cp*sqrt(kp)*d.shear_key.depth; passive+=d.passive_reduction*key_passive
+                t.add("Shear-key passive resistance","Pp,key=Kp*(sigma_v,key*Dkey+0.5*gamma*Dkey^2)+2*c*sqrt(Kp)*Dkey",{"sigma_v_key_kPa":q_key,"key_depth_m":d.shear_key.depth,"Kp":kp,"Pp_key_unreduced_kN_per_m":key_passive,"reduction":d.passive_reduction},REF["shear_key"],"Uses average base contact pressure as overburden at key; confirm local stress/soil disturbance and key location for final design.")
         resistance=friction+passive+front; fs=resistance/drive if drive else float("inf"); mo=sum(max(0,x.horizontal_kn)*x.y_m for x in hor); mr=sum(x.vertical_kn*x.x_m for x in ver)+sum(-min(0,x.horizontal_kn)*x.y_m for x in hor); fsot=mr/mo if mo else float("inf"); xr=(mr-mo)/n if n else 0.; e=xr-d.base_width/2; q=n/d.base_width; qtoe=q*(1-6*e/d.base_width); qheel=q*(1+6*e/d.base_width)
-        t.add("Sliding stability","FS=(N*tan(delta_base)+c_a*B+Ppassive+Pfront-water)/Pdrive",{"FS_sliding":fs,"driving_kN_per_m":drive,"resistance_kN_per_m":resistance},REF["stability"]); t.add("Overturning and bearing","FSot=Mresist/Moverturn; q=qavg*(1 +/- 6e/B)",{"FS_overturning":fsot,"eccentricity_m":e,"qtoe_kPa":qtoe,"qheel_kPa":qheel},REF["bearing"])
+        beff=max(.01,d.base_width-2*abs(e)); qn=1. if phi_soil<1e-6 else __import__('math').exp(__import__('math').pi*tan(radians(phi_soil)))*tan(radians(45)+radians(phi_soil)/2)**2; nc=5.14 if phi_soil<1e-6 else (qn-1)/tan(radians(phi_soil)); ng=0. if phi_soil<1e-6 else 2*(qn+1)*tan(radians(phi_soil)); q0=founding.gamma_dry*d.foundation_embedment_m; qult=c_soil*nc+q0*qn+.5*founding.gamma_dry*beff*ng; qallow_auto=qult/d.bearing_safety_factor; qallow=d.allowable_bearing_kpa if d.allowable_bearing_kpa is not None else qallow_auto
+        t.add("Sliding stability","FS=(N*tan(delta_base)+c_a*B+Ppassive+Pfront-water)/Pdrive",{"FS_sliding":fs,"driving_kN_per_m":drive,"resistance_kN_per_m":resistance,"base_friction_angle_deg":phi,"base_adhesion_kPa":adhesion,"foundation_layer_phi_deg":phi_soil,"foundation_layer_c_or_Su_kPa":c_soil},REF["stability"]); t.add("Bearing capacity","qult=c*Nc+q*Nq+0.5*gamma*B'*Ngamma; B'=B-2|e|",{"B_effective_m":beff,"Nc":nc,"Nq":qn,"Ngamma":ng,"qult_kPa":qult,"FS_bearing":d.bearing_safety_factor,"qallow_kPa":qallow,"qtoe_kPa":qtoe,"qheel_kPa":qheel},REF["bearing_capacity"],"Strip footing, homogeneous governing founding layer, Meyerhof effective-width concept. Settlement, weak-layer and slope effects are not included.")
         if not d.include_passive_front: t.warn("Passive front resistance is excluded by default; enable only when permanent cover/development are assured.")
         if d.include_passive_front and d.groundwater.front_depth is not None: t.warn("Front passive resistance uses gamma_dry; assess water/effective-stress effect before relying on it.")
         out=[Check("sliding",drive,resistance,fs,d.required_sliding_fs,fs>=d.required_sliding_fs,"FS"),Check("overturning",mo,mr,fsot,d.required_overturning_fs,fsot>=d.required_overturning_fs,"FS"),Check("resultant within middle third",abs(e),d.base_width/6,abs(e)/(d.base_width/6),1.,qtoe>=0 and qheel>=0,"m")]
-        if d.allowable_bearing_kpa is not None: out.append(Check("allowable bearing",max(qtoe,qheel),d.allowable_bearing_kpa,max(qtoe,qheel)/d.allowable_bearing_kpa,1.,max(qtoe,qheel)<=d.allowable_bearing_kpa and min(qtoe,qheel)>=0,"kPa"))
+        out.append(Check("allowable bearing",max(qtoe,qheel),qallow,max(qtoe,qheel)/qallow,1.,max(qtoe,qheel)<=qallow and min(qtoe,qheel)>=0,"kPa"))
         return out
 
     def _strip(self,name:str,mu:float,vu:float,h_m:float,c:Concrete,t:CalculationTrace,face:str)->RCDesign:
@@ -300,7 +338,7 @@ def compare_to_geo5(result: CalculationResult, geo5_values: dict[str, float]) ->
     """Compare manually supplied same-basis GEO5 values; GEO5 is non-governing."""
     forces={x.name:x.horizontal_kn for x in result.forces}; checks={x.name:x for x in result.checks}; values={"active_effective_soil_pressure":forces.get("active effective-soil pressure",0.),"behind_hydrostatic_pressure":forces.get("behind hydrostatic pressure",0.),"sliding_fs":checks["sliding"].ratio_or_fs,"overturning_fs":checks["overturning"].ratio_or_fs}
     for x in result.trace.items:
-        if x.step=="Overturning and bearing": values.update(qtoe_kpa=x.values["qtoe_kPa"],qheel_kpa=x.values["qheel_kPa"])
+        if x.step=="Bearing capacity": values.update(qtoe_kpa=x.values["qtoe_kPa"],qheel_kpa=x.values["qheel_kPa"])
     if set(geo5_values)-set(values): raise ValueError(f"unsupported GEO5 comparison keys: {sorted(set(geo5_values)-set(values))}")
     out=[GEO5Comparison(k,values[k],v,values[k]-v,100*(values[k]-v)/v if v else None) for k,v in geo5_values.items()]
     result.trace.add("GEO5 comparison","difference=engine-GEO5; comparison only",{x.quantity:asdict(x) for x in out},REF["geo5"],"Match geometry, drainage, soil, pressure method, actions, factors and passive assumptions.")
@@ -308,7 +346,7 @@ def compare_to_geo5(result: CalculationResult, geo5_values: dict[str, float]) ->
 
 
 # ---------- Engineering diagrams (drawn from the active input/result) ----------
-def _svg_wall_section(d: RetainingWallInput) -> str:
+def _svg_wall_section(d: RetainingWallInput, reinforcement: list[RCDesign] | None = None) -> str:
     """Return a proportional SVG cross-section, not a decorative static image."""
     width, height, left, base_y = 760, 420, 72, 326
     h = d.wall_height; free_x = max(2.2, .45*d.base_width)
@@ -332,14 +370,38 @@ def _svg_wall_section(d: RetainingWallInput) -> str:
     water = ""
     if d.groundwater.behind_depth is not None and d.groundwater.behind_depth<h:
         wy=top_y+d.groundwater.behind_depth*sy; water=f'<line x1="{stem_back:.1f}" y1="{wy:.1f}" x2="{width-28:.1f}" y2="{wy:.1f}" stroke="#1882b8" stroke-width="2" stroke-dasharray="8 5"/><text x="{width-125}" y="{wy-7:.1f}" class="water">GWT behind</text>'
+    layers=""; depth=0.
+    for idx,soil in enumerate(d.soils[:-1],1):
+        depth+=soil.thickness
+        if depth<h:
+            yy=top_y+depth*sy; layers+=f'<line x1="{stem_back:.1f}" y1="{yy:.1f}" x2="{width-28:.1f}" y2="{yy:.1f}" stroke="#9f8950" stroke-width="1" stroke-dasharray="4 4"/><text x="{width-96}" y="{yy-4:.1f}" class="dim">Layer {idx+1}</text>'
     front_ground_y=base_y-d.front_soil_height*sy
+    surcharge=""
+    if d.surcharge_kpa>0:
+        qx1=stem_back+28; qx2=min(width-70,qx1+150); qy=min(top_y,terrain_end_y)-28; arrows="".join(f'<line x1="{xx}" y1="{qy}" x2="{xx}" y2="{qy+18}" stroke="#665c56" stroke-width="1.3"/><path d="M {xx-4} {qy+13} L {xx} {qy+18} L {xx+4} {qy+13}" fill="none" stroke="#665c56"/>' for xx in range(int(qx1+12),int(qx2),28)); surcharge=f'<line x1="{qx1:.1f}" y1="{qy:.1f}" x2="{qx2:.1f}" y2="{qy:.1f}" stroke="#665c56" stroke-width="1.3"/>{arrows}<text x="{qx1:.1f}" y="{qy-8:.1f}" class="label">Surcharge q = {d.surcharge_kpa:.1f} kPa</text>'
+    actions=""
+    for frac in (.30,.55,.80):
+        yy=top_y+frac*h*sy; xx=stem_back+18+frac*42; actions+=f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{stem_back+4:.1f}" y2="{yy:.1f}" stroke="#c7532d" stroke-width="1.6"/><path d="M {stem_back+10:.1f} {yy-4:.1f} L {stem_back+4:.1f} {yy:.1f} L {stem_back+10:.1f} {yy+4:.1f}" fill="none" stroke="#c7532d"/>'
+    actions+=f'<text x="{stem_back+42:.1f}" y="{top_y+h*sy*.58:.1f}" class="label">Pₐ</text>'
+    rebar=""
+    if reinforcement:
+        schedule={x.component:x for x in reinforcement}; stem=schedule.get("stem"); heel=schedule.get("heel slab"); toe=schedule.get("toe slab")
+        # Schematic only: red lines locate primary tension reinforcement faces.
+        if stem:
+            xx=stem_back-8
+            rebar="".join(f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{xx:.1f}" y2="{min(base_y-8,yy+45):.1f}" stroke="#be3343" stroke-width="2"/>' for yy in range(int(top_y+12),int(base_y-15),28))
+            rebar+=f'<text x="{xx+8:.1f}" y="{top_y+18:.1f}" class="label" fill="#be3343">Stem: D{stem.bar_diameter_mm:.0f}@{stem.spacing_mm}</text>'
+        if heel:
+            yy=base_y+10; rebar+="".join(f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{min(heel_end-8,xx+35):.1f}" y2="{yy:.1f}" stroke="#be3343" stroke-width="2"/>' for xx in range(int(stem_back+12),int(heel_end-14),30)); rebar+=f'<text x="{stem_back+10:.1f}" y="{yy+24:.1f}" class="label">Heel: D{heel.bar_diameter_mm:.0f}@{heel.spacing_mm}</text>'
+        if toe:
+            yy=slab_bottom-10; rebar+="".join(f'<line x1="{xx:.1f}" y1="{yy:.1f}" x2="{min(stem_front-8,xx+28):.1f}" y2="{yy:.1f}" stroke="#be3343" stroke-width="2"/>' for xx in range(int(toe_x+10),int(stem_front-12),26)); rebar+=f'<text x="{toe_x+4:.1f}" y="{yy-9:.1f}" class="label">Toe: D{toe.bar_diameter_mm:.0f}@{toe.spacing_mm}</text>'
     return f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Proportional retaining-wall cross-section" class="eng-svg" style="width:100%;height:auto;display:block">
     <style>.eng-svg{{font-family:Arial,sans-serif;background:#fff}}.label{{font-size:13px;fill:#31445a}}.water{{font-size:12px;fill:#0877aa;font-weight:600}}.dim{{font-size:12px;fill:#5e7085}}.ground{{stroke:#68727d;stroke-width:2.2;fill:none}}</style>
     <title>Retaining wall geometry</title><desc>Cross-section generated from wall input, including retained soil, water table, optional stiffener and shear key.</desc>
     <rect width="{width}" height="{height}" fill="#fbfcfe"/><path d="M {stem_back:.1f} {base_y:.1f} L {stem_back:.1f} {top_y:.1f} L {width-28:.1f} {terrain_end_y:.1f} L {width-28:.1f} {base_y:.1f} Z" fill="#e7d8ae" opacity=".72"/>
     <path d="M {stem_back:.1f} {top_y:.1f} L {width-28:.1f} {terrain_end_y:.1f}" class="ground"/><path d="M {toe_x-12:.1f} {front_ground_y:.1f} L {stem_front:.1f} {front_ground_y:.1f}" class="ground"/>
     <rect x="{toe_x:.1f}" y="{base_y:.1f}" width="{d.base_width*sx:.1f}" height="{d.base_thickness*sy:.1f}" fill="#c7d2d9" stroke="#465765" stroke-width="2"/><path d="M {wall_poly} Z" fill="#c7d2d9" stroke="#465765" stroke-width="2"/>
-    {stiffener}{key}{water}
+    {stiffener}{key}{water}{layers}{surcharge}{actions}{rebar}
     <line x1="{toe_x:.1f}" y1="{top_y:.1f}" x2="{toe_x:.1f}" y2="{base_y:.1f}" stroke="#8d9baa" stroke-width="1.3" stroke-dasharray="3 3"/><line x1="{toe_x-8:.1f}" y1="{top_y:.1f}" x2="{toe_x+8:.1f}" y2="{top_y:.1f}" stroke="#8d9baa"/><line x1="{toe_x-8:.1f}" y1="{base_y:.1f}" x2="{toe_x+8:.1f}" y2="{base_y:.1f}" stroke="#8d9baa"/><text x="{toe_x-52:.1f}" y="{(top_y+base_y)/2:.1f}" class="dim">H = {h:.2f} m</text>
     <text x="{stem_front-8:.1f}" y="{top_y-12:.1f}" class="label">Stem</text><text x="{(toe_x+stem_front)/2-10:.1f}" y="{slab_bottom+30:.1f}" class="label">Toe</text><text x="{(stem_back+heel_end)/2-12:.1f}" y="{slab_bottom+30:.1f}" class="label">Heel</text><text x="{width-170}" y="{max(30,terrain_end_y-10):.1f}" class="label">Retained terrain</text><text x="{toe_x-10:.1f}" y="{front_ground_y-10:.1f}" class="label">Front soil</text>
     <rect x="{width-245}" y="{height-42}" width="12" height="12" fill="#c7d2d9"/><text x="{width-228}" y="{height-31}" class="dim">Concrete</text><rect x="{width-148}" y="{height-42}" width="12" height="12" fill="#e7d8ae"/><text x="{width-130}" y="{height-31}" class="dim">Soil</text></svg>'''
@@ -352,11 +414,11 @@ def _pressure_profile(d: RetainingWallInput, count: int = 31) -> list[tuple[floa
         z=i*dz
         if i:
             mid=z-dz/2; soil_mid=layer_at(d.soils,mid)
-            gamma=max(.01,soil_mid.gamma_sat-d.groundwater.gamma_water) if d.groundwater.behind_depth is not None and mid>d.groundwater.behind_depth else soil_mid.gamma_dry
+            gamma=soil_mid.gamma_sat if d.strength_mode=="undrained" else (max(.01,soil_mid.gamma_sat-d.groundwater.gamma_water) if d.groundwater.behind_depth is not None and mid>d.groundwater.behind_depth else soil_mid.gamma_dry)
             sigma += gamma*dz
-        soil=layer_at(d.soils,min(z,max(0,d.wall_height-1e-9))); ka=rankine_ka(soil.phi_deg,d.terrain.beta_rad)
-        ps=max(0.,ka*sigma-2*soil.cohesion*sqrt(ka)); pq=ka*d.surcharge_kpa; pe=0.
-        if d.kh: pe=max(0.,(mononobe_okabe_kae(soil.phi_deg,d.terrain.beta_rad,soil.interface_delta_deg,d.kh,d.kv)-ka)*sigma)
+        soil=layer_at(d.soils,min(z,max(0,d.wall_height-1e-9))); phi,cohesion,delta=design_shear_parameters(soil,d); ka=1. if d.strength_mode=="undrained" else rankine_ka(phi,d.terrain.beta_rad)
+        ps=max(0.,ka*sigma-2*cohesion*sqrt(ka)); pq=ka*d.surcharge_kpa; pe=0.
+        if d.design_kh and d.strength_mode=="drained": pe=max(0.,(mononobe_okabe_kae(phi,d.terrain.beta_rad,delta,d.design_kh,d.design_kv)-ka)*sigma)
         pw=d.groundwater.gamma_water*max(0.,z-d.groundwater.behind_depth) if d.groundwater.behind_depth is not None else 0.
         values.append((z,ps,pq,pe,pw))
     return values
@@ -368,7 +430,7 @@ def _svg_stress_diagrams(result: CalculationResult) -> str:
     path=lambda index: " ".join(f"{x0+v[index]*scale:.1f},{y0+v[0]/d.wall_height*plot_h:.1f}" for v in pts)
     total=" ".join(f"{x0+sum(v[1:])*scale:.1f},{y0+v[0]/d.wall_height*plot_h:.1f}" for v in pts)
     fill=f"{x0},{y0} {total} {x0},{y0+plot_h}"
-    trace=next((x.values for x in result.trace.items if x.step=="Overturning and bearing"),{})
+    trace=next((x.values for x in result.trace.items if x.step=="Bearing capacity"),{})
     qtoe=float(trace.get("qtoe_kPa",0));qheel=float(trace.get("qheel_kPa",0));qmax=max(1,abs(qtoe),abs(qheel)); bx1,bx2,by=430,690,352; qscale=72/qmax
     return f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Lateral stress and base contact-pressure diagrams" class="eng-svg" style="width:100%;height:auto;display:block"><style>.eng-svg{{font-family:Arial,sans-serif;background:#fff}}.axis{{stroke:#546273;stroke-width:1.5}}.grid{{stroke:#dce3ea;stroke-width:1}}.txt{{font-size:12px;fill:#36485e}}.small{{font-size:11px;fill:#66778b}}.head{{font-size:14px;fill:#24384e;font-weight:600}}</style><title>Working stress diagrams</title><desc>Calculated retained-side lateral-pressure distribution and base contact-pressure distribution.</desc>
     <rect width="{width}" height="{height}" fill="#fbfcfe"/><text x="{x0}" y="25" class="head">Retained-side lateral pressure</text><text x="{x0}" y="43" class="small">Depth below retained top [m] • pressure [kPa]</text>
@@ -391,7 +453,7 @@ def _streamlit_soil_layers(rows: Any) -> tuple[SoilLayer, ...]:
     result = []
     for row in _streamlit_rows(rows):
         if float(row.get("thickness", 0)) > 0:
-            result.append(SoilLayer(float(row["thickness"]), float(row["gamma_dry"]), float(row["gamma_sat"]), float(row["phi_deg"]), float(row.get("cohesion", 0)), float(row.get("interface_delta_deg", 0))))
+            result.append(SoilLayer(float(row["thickness"]), float(row["gamma_dry"]), float(row["gamma_sat"]), float(row["phi_deg"]), float(row.get("cohesion", 0)), float(row.get("interface_delta_deg", 0)), float(row.get("su_kpa", 0))))
     if not result: raise ValueError("Enter at least one soil layer with positive thickness.")
     return tuple(result)
 
@@ -411,6 +473,8 @@ def streamlit_app() -> None:
     [data-testid="stMain"] [data-baseweb="input"] > div, [data-testid="stMain"] [data-baseweb="select"] > div {background:#fff !important;border-color:#cbd5e1 !important}
     [data-testid="stMain"] [data-baseweb="input"] input, [data-testid="stMain"] [data-baseweb="select"] * {color:#17233a !important}
     [data-testid="stMain"] [data-testid="stMetricLabel"] *, [data-testid="stMain"] [data-testid="stMetricValue"] * {color:#17233a !important}
+    [data-testid="stTabs"] button [data-testid="stMarkdownContainer"] p {color:#34445f !important;opacity:1 !important;font-weight:600}
+    [data-testid="stTabs"] button[aria-selected="true"] [data-testid="stMarkdownContainer"] p {color:#c94351 !important}
     .hero {background:linear-gradient(115deg,#11244a,#1d5f83);border-radius:14px;padding:22px 28px;color:white;margin-bottom:18px}
     .hero h1 {margin:0;font-size:1.6rem;letter-spacing:.1px}.hero p {margin:.35rem 0 0;opacity:.82}
     div[data-testid="stMetric"] {background:white;border:1px solid #e2e8f0;border-radius:10px;padding:12px 15px;box-shadow:0 1px 3px #14213d10}
@@ -432,22 +496,22 @@ def streamlit_app() -> None:
         st.caption("Review warnings before relying on any result.")
 
     st.markdown("""<div class="hero"><h1>Reinforced-Concrete Retaining Wall</h1><p>Transparent preliminary design • auditable calculation trace • SNI-first reference hierarchy</p></div>""", unsafe_allow_html=True)
-    tab_g, tab_s, tab_l, tab_r = st.tabs(["Geometry", "Ground & water", "Actions", "Results & audit"])
+    tab_g, tab_l, tab_r = st.tabs(["Geometry, soil layers & GWT", "Actions, seismic & design", "Results & audit"])
 
     with tab_g:
         st.subheader("Wall geometry")
         st.markdown("<p class='section-note'>Use one common project datum for elevations. Wall height is derived from retained-top minus base-top elevation.</p>", unsafe_allow_html=True)
         a,b,c = st.columns(3)
         with a:
-            st.number_input("Base-top elevation [m]", value=100.0, step=.1, key="base_el")
-            st.number_input("Retained-soil top elevation [m]", value=106.0, step=.1, key="retained_el")
+            st.number_input("EL bottom of base slab [m datum]", value=99.40, step=.1, key="base_bottom_el")
+            st.number_input("EL retained ground / backfill surface [m datum]", value=106.0, step=.1, key="retained_el")
         with b:
-            st.number_input("Front-soil top elevation [m]", value=102.0, step=.1, key="front_el")
+            st.number_input("EL exposed front ground / excavation surface [m datum]", value=102.0, step=.1, key="front_el")
             st.number_input("Base thickness [m]", min_value=.10, value=.60, step=.05, key="base_t")
         with c:
-            h_display = st.session_state.get("retained_el",106.0)-st.session_state.get("base_el",100.0)
-            st.metric("Derived retained height", f"{h_display:.2f} m")
-            st.caption("Must be positive; the engine uses base-top as its internal vertical datum.")
+            h_display = st.session_state.get("retained_el",106.0)-(st.session_state.get("base_bottom_el",99.4)+st.session_state.get("base_t",.6))
+            st.metric("Derived retained height above top base", f"{h_display:.2f} m")
+            st.caption(f"EL top of base slab = {st.session_state.get('base_bottom_el',99.4)+st.session_state.get('base_t',.6):.2f} m datum")
         st.divider(); c1,c2,c3 = st.columns(3)
         with c1:
             st.number_input("Toe width [m]", min_value=0.0, value=1.20, step=.05, key="toe")
@@ -477,36 +541,46 @@ def streamlit_app() -> None:
                 with q2: st.number_input("Key thickness [m]",min_value=.05,value=.30,step=.05,key="key_t")
                 with q3: st.number_input("Key x from toe [m]",min_value=0.0,value=1.0,step=.05,key="key_x")
 
-    default_rear = [{"thickness":2.0,"gamma_dry":18.0,"gamma_sat":20.0,"phi_deg":32.0,"cohesion":0.0,"interface_delta_deg":0.0},{"thickness":8.0,"gamma_dry":19.0,"gamma_sat":21.0,"phi_deg":30.0,"cohesion":0.0,"interface_delta_deg":0.0}]
-    default_front = [{"thickness":3.0,"gamma_dry":18.0,"gamma_sat":20.0,"phi_deg":30.0,"cohesion":0.0,"interface_delta_deg":0.0}]
-    with tab_s:
+    default_rear = [{"thickness":2.0,"gamma_dry":18.0,"gamma_sat":20.0,"phi_deg":32.0,"cohesion":0.0,"interface_delta_deg":0.0,"su_kpa":0.0},{"thickness":8.0,"gamma_dry":19.0,"gamma_sat":21.0,"phi_deg":30.0,"cohesion":0.0,"interface_delta_deg":0.0,"su_kpa":0.0}]
+    default_front = [{"thickness":3.0,"gamma_dry":18.0,"gamma_sat":20.0,"phi_deg":30.0,"cohesion":0.0,"interface_delta_deg":0.0,"su_kpa":0.0}]
+    with tab_g:
         st.subheader("Retained-side soil profile")
         st.markdown("<p class='section-note'>Layer thickness is measured downward from the retained-soil surface. Add, delete, or edit rows as needed.</p>", unsafe_allow_html=True)
-        rear = st.data_editor(default_rear, num_rows="dynamic", hide_index=True, key="rear_soil", width="stretch", column_config={"thickness":"Thickness [m]","gamma_dry":"γ dry [kN/m³]","gamma_sat":"γ sat [kN/m³]","phi_deg":"φ′ [deg]","cohesion":"c′ [kPa]","interface_delta_deg":"δ [deg]"})
+        rear = st.data_editor(default_rear, num_rows="dynamic", hide_index=True, key="rear_soil", width="stretch", column_config={"thickness":"Thickness [m]","gamma_dry":"γ dry [kN/m³]","gamma_sat":"γ sat [kN/m³]","phi_deg":"φ′ [deg]","cohesion":"c′ [kPa]","interface_delta_deg":"δ [deg]","su_kpa":"Su [kPa]"})
         st.subheader("Front-side soil profile")
         st.markdown("<p class='section-note'>Leave equivalent to the retained profile only if the front ground is genuinely the same material sequence.</p>", unsafe_allow_html=True)
-        front = st.data_editor(default_front, num_rows="dynamic", hide_index=True, key="front_soil", width="stretch", column_config={"thickness":"Thickness [m]","gamma_dry":"γ dry [kN/m³]","gamma_sat":"γ sat [kN/m³]","phi_deg":"φ′ [deg]","cohesion":"c′ [kPa]","interface_delta_deg":"δ [deg]"})
+        front = st.data_editor(default_front, num_rows="dynamic", hide_index=True, key="front_soil", width="stretch", column_config={"thickness":"Thickness [m]","gamma_dry":"γ dry [kN/m³]","gamma_sat":"γ sat [kN/m³]","phi_deg":"φ′ [deg]","cohesion":"c′ [kPa]","interface_delta_deg":"δ [deg]","su_kpa":"Su [kPa]"})
         st.divider(); st.subheader("Groundwater and drainage")
         w1,w2,w3=st.columns(3)
-        with w1: st.toggle("Groundwater behind", value=True, key="gwt_back_on"); st.number_input("Depth below retained top [m]",min_value=0.0,value=2.5,step=.1,key="gwt_back",disabled=not st.session_state.get("gwt_back_on"))
-        with w2: st.toggle("Groundwater in front", value=True, key="gwt_front_on"); st.number_input("Depth below front top [m]",min_value=0.0,value=.8,step=.1,key="gwt_front",disabled=not st.session_state.get("gwt_front_on"))
+        with w1: st.toggle("Water behind wall", value=True, key="gwt_back_on"); st.number_input("EL water behind [m datum]",value=103.5,step=.1,key="gwt_back_el",disabled=not st.session_state.get("gwt_back_on"))
+        with w2: st.toggle("Water / pond in front", value=True, key="gwt_front_on"); st.number_input("EL water in front [m datum]",value=101.2,step=.1,key="gwt_front_el",disabled=not st.session_state.get("gwt_front_on"))
         with w3: st.number_input("Water unit weight [kN/m³]",min_value=9.0,max_value=10.5,value=9.81,step=.01,key="gamma_w")
         st.info("Hydrostatic pressures on both faces are included. Uplift, drainage flow, custom pore-pressure profiles, capillary action, and hydrodynamic water require a project-specific assessment.")
+        try:
+            _base_top=st.session_state.base_bottom_el+st.session_state.base_t
+            _preview=RetainingWallInput(wall_height=st.session_state.retained_el-_base_top,base_top_elevation=_base_top,retained_top_elevation=st.session_state.retained_el,front_soil_elevation=st.session_state.front_el,stem_thickness_top=st.session_state.stem_top,stem_thickness_base=st.session_state.stem_base,toe_width=st.session_state.toe,heel_width=st.session_state.heel,base_thickness=st.session_state.base_t,soils=_streamlit_soil_layers(rear),front_soils=_streamlit_soil_layers(front),terrain=Terrain(TerrainKind(st.session_state.terrain_kind),st.session_state.slope,st.session_state.flat_len),groundwater=Groundwater(st.session_state.retained_el-st.session_state.gwt_back_el if st.session_state.gwt_back_on else None,st.session_state.front_el-st.session_state.gwt_front_el if st.session_state.gwt_front_on else None,st.session_state.gamma_w))
+            st.subheader("Live geometry and layering illustration")
+            st.caption("All elevations use the project datum: bottom base slab, top base slab, backfill, front/excavation, and water levels are shown explicitly.")
+            st.markdown(_svg_wall_section(_preview),unsafe_allow_html=True)
+        except Exception as exc:
+            st.warning(f"Geometry preview will appear after the minimum geometry and soil inputs are valid: {exc}")
 
     with tab_l:
         st.subheader("Actions and stability criteria")
         l1,l2,l3=st.columns(3)
         with l1:
             st.number_input("Uniform surcharge [kPa]",min_value=0.0,value=12.0,step=1.0,key="surcharge")
-            st.number_input("Base friction angle δbase [deg]",min_value=0.0,max_value=50.0,value=28.0,step=.5,key="base_phi")
-            st.number_input("Base adhesion [kPa]",min_value=0.0,value=0.0,step=1.0,key="adhesion")
+            st.info("Base friction angle and base adhesion are identified automatically from the governing founding layer, the selected strength basis, and the interface factors below.")
         with l2:
-            st.number_input("Horizontal seismic coefficient kh",min_value=0.0,max_value=.6,value=.12,step=.01,key="kh")
-            st.number_input("Vertical seismic coefficient kv",min_value=-.49,max_value=.49,value=0.0,step=.01,key="kv")
+            st.number_input("PGAm [g]",min_value=0.0,max_value=2.0,value=.20,step=.01,key="pga_m")
+            st.number_input("PGAm reduction factor ηPGA",min_value=0.0,max_value=1.0,value=.60,step=.05,key="pga_red")
+            st.number_input("Earthquake return period [years]",min_value=1.0,value=475.0,step=25.0,key="return_period")
+            st.number_input("kv / kh",min_value=-1.0,max_value=1.0,value=0.0,step=.05,key="kvkh")
+            st.caption("Derived kh = PGAm × ηPGA")
             st.toggle("Include reduced passive front resistance",value=True,key="passive_on")
             st.number_input("Passive reduction factor",min_value=0.0,max_value=1.0,value=.50,step=.05,key="passive_red",disabled=not st.session_state.get("passive_on"))
         with l3:
-            st.number_input("Allowable bearing pressure [kPa]",min_value=1.0,value=250.0,step=10.0,key="q_allow")
+            st.info("Allowable bearing is calculated automatically from the governing founding layer and bearing FS.")
             st.number_input("Required sliding FS",min_value=.1,value=1.50,step=.05,key="fs_slide")
             st.number_input("Required overturning FS",min_value=.1,value=2.00,step=.05,key="fs_ot")
             st.number_input("Preliminary RC load factor",min_value=.1,value=1.60,step=.05,key="strength_factor")
@@ -514,17 +588,23 @@ def streamlit_app() -> None:
         d1,d2,d3=st.columns(3)
         with d1: st.number_input("f′c [MPa]",min_value=15.0,value=28.0,step=1.0,key="fc");st.number_input("fy [MPa]",min_value=250.0,value=420.0,step=10.0,key="fy")
         with d2: st.number_input("Concrete unit weight [kN/m³]",min_value=20.0,value=24.0,step=.5,key="conc_g");st.number_input("Cover [mm]",min_value=20.0,value=50.0,step=5.0,key="cover");st.number_input("Main bar diameter [mm]",min_value=10.0,value=16.0,step=2.0,key="bar_d")
-        with d3: st.toggle("Record external global-stability result",value=False,key="global_on");st.number_input("External global FS",min_value=.01,value=1.50,step=.05,key="global_fs",disabled=not st.session_state.get("global_on"));st.number_input("Required global FS",min_value=.1,value=1.50,step=.05,key="global_req")
+        with d3: st.selectbox("Soil strength basis",["Drained effective stress", "Undrained total stress"],key="strength_mode_ui");st.number_input("Shear-strength reduction η",min_value=.05,max_value=1.0,value=1.0,step=.05,key="shear_red");st.number_input("Base interface factor",min_value=0.0,max_value=1.0,value=.67,step=.05,key="base_interface");st.number_input("Undrained adhesion factor α",min_value=0.0,max_value=1.0,value=.50,step=.05,key="alpha_adh")
+        g1,g2,g3=st.columns(3)
+        with g1: st.number_input("Bearing capacity FS",min_value=1.0,value=3.0,step=.25,key="bearing_fs");st.number_input("Foundation embedment Df [m]",min_value=0.0,value=0.0,step=.1,key="embedment")
+        with g2: st.toggle("Include seismic hydrodynamic water",value=False,key="hydro_dynamic");st.toggle("Record external global-stability result",value=False,key="global_on")
+        with g3: st.number_input("External global FS",min_value=.01,value=1.50,step=.05,key="global_fs",disabled=not st.session_state.get("global_on"));st.number_input("Required global FS",min_value=.1,value=1.50,step=.05,key="global_req")
+        with st.expander("Seismic water and excess pore-water pressure: design basis"):
+            st.markdown("**Free water:** when enabled, the engine applies the simplified Westergaard increment `Pwd = 7/12 · kh · γw · Hw²` at `0.4Hw` on each wetted face. **Excess pore-water pressure in soil:** this is not a universal fixed percentage. It must come from a liquefaction/cyclic-response assessment using site investigation and the design earthquake; use its depth-dependent pore-pressure/strength result in a project-specific model. Mononobe-Okabe is restricted here to drained analysis and is not used as a substitute for liquefaction analysis.")
         st.warning("Seismic analysis is pseudo-static. Verify project seismic criteria, hydrodynamic water, deformation/displacement, and code-specific load combinations separately.")
 
     if run:
         try:
-            ss=st.session_state; h=ss.retained_el-ss.base_el
+            ss=st.session_state; base_top=ss.base_bottom_el+ss.base_t; h=ss.retained_el-base_top
             stiffener=None
             if ss.stiff_type != "None":
                 stiffener=Stiffener("heel" if ss.stiff_type.startswith("Counterfort") else "toe",ss.stiff_spacing,ss.stiff_t,ss.stiff_top,ss.stiff_const,ss.stiff_top_d,ss.stiff_base_d)
             key=ShearKey(ss.key_d,ss.key_t,ss.key_x) if ss.key_on else None
-            inp=RetainingWallInput(wall_height=h,base_top_elevation=ss.base_el,retained_top_elevation=ss.retained_el,front_soil_elevation=ss.front_el,stem_thickness_top=ss.stem_top,stem_thickness_base=ss.stem_base,toe_width=ss.toe,heel_width=ss.heel,base_thickness=ss.base_t,soils=_streamlit_soil_layers(rear),front_soils=_streamlit_soil_layers(front),terrain=Terrain(TerrainKind(ss.terrain_kind),ss.slope,ss.flat_len),groundwater=Groundwater(ss.gwt_back if ss.gwt_back_on else None,ss.gwt_front if ss.gwt_front_on else None,ss.gamma_w),surcharge_kpa=ss.surcharge,base_friction_angle_deg=ss.base_phi,adhesion_kpa=ss.adhesion,allowable_bearing_kpa=ss.q_allow,kh=ss.kh,kv=ss.kv,include_passive_front=ss.passive_on,passive_reduction=ss.passive_red,shear_key=key,stiffener=stiffener,concrete=Concrete(ss.fc,ss.fy,ss.conc_g,ss.cover,ss.bar_d),global_stability=GlobalStabilityInput(ss.global_fs if ss.global_on else None,ss.global_req,"user-supplied external result"),required_sliding_fs=ss.fs_slide,required_overturning_fs=ss.fs_ot,strength_load_factor=ss.strength_factor)
+            inp=RetainingWallInput(wall_height=h,base_top_elevation=base_top,retained_top_elevation=ss.retained_el,front_soil_elevation=ss.front_el,stem_thickness_top=ss.stem_top,stem_thickness_base=ss.stem_base,toe_width=ss.toe,heel_width=ss.heel,base_thickness=ss.base_t,soils=_streamlit_soil_layers(rear),front_soils=_streamlit_soil_layers(front),terrain=Terrain(TerrainKind(ss.terrain_kind),ss.slope,ss.flat_len),groundwater=Groundwater(ss.retained_el-ss.gwt_back_el if ss.gwt_back_on else None,ss.front_el-ss.gwt_front_el if ss.gwt_front_on else None,ss.gamma_w),surcharge_kpa=ss.surcharge,base_friction_angle_deg=None,adhesion_kpa=0.0,allowable_bearing_kpa=None,include_passive_front=ss.passive_on,passive_reduction=ss.passive_red,shear_key=key,stiffener=stiffener,concrete=Concrete(ss.fc,ss.fy,ss.conc_g,ss.cover,ss.bar_d),global_stability=GlobalStabilityInput(ss.global_fs if ss.global_on else None,ss.global_req,"user-supplied external result"),required_sliding_fs=ss.fs_slide,required_overturning_fs=ss.fs_ot,strength_load_factor=ss.strength_factor,strength_mode="drained" if ss.strength_mode_ui.startswith("Drained") else "undrained",shear_strength_reduction=ss.shear_red,base_interface_factor=ss.base_interface,undrained_adhesion_factor=ss.alpha_adh,foundation_embedment_m=ss.embedment,bearing_safety_factor=ss.bearing_fs,pga_m_g=ss.pga_m,pga_reduction_factor=ss.pga_red,return_period_years=ss.return_period,vertical_to_horizontal_ratio=ss.kvkh,include_hydrodynamic_water=ss.hydro_dynamic)
             st.session_state["rw_result"]=RetainingWallEngine().run(inp);st.session_state["rw_error"]=None
         except Exception as exc: st.session_state["rw_error"]=str(exc)
 
@@ -538,7 +618,7 @@ def streamlit_app() -> None:
             m1,m2,m3,m4=st.columns(4);m1.metric("Overall status","PASS" if result.passed else "REVIEW");m2.metric("Sliding FS",f"{slide.ratio_or_fs:.2f}",f"Required ≥ {slide.required:.2f}");m3.metric("Overturning FS",f"{ot.ratio_or_fs:.2f}",f"Required ≥ {ot.required:.2f}");m4.metric("Max bearing",f"{bearing.demand:.1f} kPa" if bearing else "Not set",f"Allowable {bearing.capacity:.1f} kPa" if bearing else None)
             st.divider(); st.subheader("Geometry and working-stress diagrams")
             st.caption("Proportional cross-section from active wall geometry")
-            st.markdown(_svg_wall_section(result.input), unsafe_allow_html=True)
+            st.markdown(_svg_wall_section(result.input, result.reinforcement), unsafe_allow_html=True)
             st.caption("Calculated pressure distributions from the active load case")
             st.markdown(_svg_stress_diagrams(result), unsafe_allow_html=True)
             st.divider();st.subheader("External stability checks")
